@@ -310,20 +310,29 @@ def get_promoted_dtype(
     return dtype
 
 
-def get_overloads(aten_fn: Union[list[Any], tuple[Any], Any]) -> list[Any]:
+def get_overloads(
+    aten_fn: Union[
+        list[Union[torch._ops.OpOverload, torch._ops.OpOverloadPacket]],
+        tuple[Union[torch._ops.OpOverload, torch._ops.OpOverloadPacket]],
+        Union[torch._ops.OpOverload, torch._ops.OpOverloadPacket],
+    ],
+) -> list[torch._ops.OpOverload]:
+    aten_fn_overlead_ops = []
     if not isinstance(aten_fn, (list, tuple)):
-        aten_fn = [aten_fn]
+        aten_fn_list = [aten_fn]
     else:
-        aten_fn = list(aten_fn)
+        aten_fn_list = list(aten_fn)
 
-    for fn in list(aten_fn):
+    for fn in list(aten_fn_list):
         if isinstance(fn, torch._ops.OpOverloadPacket):
             for overload in fn.overloads():
                 other_fn = getattr(fn, overload)
                 if other_fn not in lowerings:
-                    aten_fn.append(other_fn)
+                    aten_fn_overlead_ops.append(other_fn)
+        else:
+            aten_fn_overlead_ops.append(fn)
 
-    return aten_fn
+    return aten_fn_overlead_ops
 
 
 def in_namespace(
@@ -409,7 +418,7 @@ def transform_args(
 
 
 def _register_foreach_lowering(
-    aten_fn: torch._ops.OpOverloadPacket, decomp_fn: Callable[..., Any]
+    aten_fn: torch._ops.OpOverload, decomp_fn: Callable[..., Any]
 ) -> Callable[..., Any]:
     """
     Add a foreach lowering to lowerings dict.
