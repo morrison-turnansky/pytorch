@@ -278,7 +278,7 @@ def decode_dtype(dtype: Union[int, torch.dtype]) -> torch.dtype:
     return dtype
 
 
-def is_integer_type(x: Any) -> bool:
+def is_integer_type(x) -> bool:
     if isinstance(x, TensorBox):
         return is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype())
     elif isinstance(x, sympy.Expr):
@@ -287,7 +287,7 @@ def is_integer_type(x: Any) -> bool:
         return isinstance(x, int)
 
 
-def is_boolean_type(x: Any) -> bool:
+def is_boolean_type(x) -> bool:
     if isinstance(x, TensorBox):
         return is_boolean_dtype(x.get_dtype())
     else:
