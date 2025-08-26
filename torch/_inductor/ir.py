@@ -151,7 +151,7 @@ _V = TypeVar("_V")
 _IntLike: TypeAlias = Union[int, Expr]
 _NumLike: TypeAlias = Union[int, float, Expr]
 
-_OpOverloads: TypeAlias = Union[torch._ops.OpOverload, torch._ops.HigherOrderOperator]
+OpOverloadTypes: TypeAlias = Union[torch._ops.OpOverload, torch._ops.HigherOrderOperator]
 
 log = logging.getLogger(__name__)
 indent = functools.partial(textwrap.indent, prefix="  ")
@@ -5474,7 +5474,7 @@ class ExternKernel(InputsKernel):
     ordered_kwargs_for_cpp_kernel: Iterable[str] = dataclasses.field(
         default_factory=list
     )
-    op_overload: Optional[_OpOverloads] = None
+    op_overload: Optional[OpOverloadTypes] = None
     arg_properties: Optional[list[dict[str, Any]]] = None
     allarg_properties: dict[str, dict[str, Any]] = dataclasses.field(
         default_factory=dict
@@ -5496,7 +5496,7 @@ class ExternKernel(InputsKernel):
         python_kernel_name: Optional[str] = None,
         cpp_kernel_name: Optional[str] = None,
         ordered_kwargs_for_cpp_kernel: Iterable[str] = (),
-        op_overload: Optional[_OpOverloads] = None,
+        op_overload: Optional[OpOverloadTypes] = None,
     ) -> None:
         super().__init__(
             name=name,
@@ -5644,7 +5644,7 @@ class ExternKernel(InputsKernel):
 
     @classmethod
     def process_kernel(
-        cls, kernel: _OpOverloads, *args: Any, **kwargs: Any
+        cls, kernel: OpOverloadTypes, *args: Any, **kwargs: Any
     ) -> tuple[
         Any,
         list[Any],
@@ -6359,7 +6359,7 @@ class ExternKernelOut(ExternKernel):
         python_kernel_name: Optional[str] = None,
         cpp_kernel_name: Optional[str] = None,
         ordered_kwargs_for_cpp_kernel: Sequence[Any] = (),
-        op_overload: Optional[_OpOverloads] = None,
+        op_overload: Optional[OpOverloadTypes] = None,
     ) -> None:
         unwrapped_inputs = self.unwrap_storage(inputs)
         assert isinstance(unwrapped_inputs, Sequence), type(unwrapped_inputs)
@@ -6415,7 +6415,7 @@ class ExternKernelAlloc(ExternKernel):
         python_kernel_name: Optional[str] = None,
         cpp_kernel_name: Optional[str] = None,
         ordered_kwargs_for_cpp_kernel: Sequence[Any] = (),
-        op_overload: Optional[_OpOverloads] = None,
+        op_overload: Optional[OpOverloadTypes] = None,
     ) -> None:
         unwrapped_inputs = self.unwrap_storage(inputs)
         assert all(isinstance(i, IRNode) for i in unwrapped_inputs)
@@ -6876,7 +6876,7 @@ class InplaceBernoulliFallback(ExternKernel):
         return OrderedSet()
 
     def __init__(
-        self, op_overload: _OpOverloads, x: IRNode, *constant_args: Any
+        self, op_overload: OpOverloadTypes, x: IRNode, *constant_args: Any
     ) -> None:
         super().__init__(
             None,
@@ -7056,7 +7056,7 @@ class ScatterFallback(ExternKernel):
 
     def __init__(
         self,
-        op_overload: _OpOverloads,
+        op_overload: OpOverloadTypes,
         x: IRNode,
         dim: int,
         index: IRNode,
@@ -7349,7 +7349,7 @@ class FallbackKernel(ExternKernelAlloc):
     def __init__(
         self,
         layout: OutputSpec,
-        kernel: _OpOverloads,
+        kernel: OpOverloadTypes,
         tensor_args: Sequence[IRNode],
         nontensor_args: Sequence[Any],
         unflatten_args: Callable[..., Any],
@@ -7769,8 +7769,8 @@ class FallbackKernel(ExternKernelAlloc):
         )
 
     @classmethod
-    def create(cls, kernel: _OpOverloads, *args: Any, **kwargs: Any) -> FallbackKernel:
-        """Create an instance of FallbackKernel from an _OpOverloads"""
+    def create(cls, kernel: OpOverloadTypes, *args: Any, **kwargs: Any) -> FallbackKernel:
+        """Create an instance of FallbackKernel from an OpOverloadTypes"""
         fake_incorrect_kernels = (aten._fused_moving_avg_obs_fq_helper_functional,)
         if kernel not in fake_incorrect_kernels:
             context = cast(AbstractContextManager[None], V.graph.fake_mode)
@@ -7880,7 +7880,7 @@ class ComplexView(FallbackKernel):
     def __init__(
         self,
         layout: OutputSpec,
-        kernel: _OpOverloads,
+        kernel: OpOverloadTypes,
         tensor_args: Sequence[IRNode],
         nontensor_args: Sequence[Any],
         unflatten_args: Callable[..., Any],
@@ -8777,7 +8777,7 @@ class EffectfulKernel(FallbackKernel):
     def __init__(
         self,
         layout: OutputSpec,
-        kernel: _OpOverloads,
+        kernel: OpOverloadTypes,
         tensor_args: Sequence[IRNode],
         nontensor_args: Sequence[Any],
         unflatten_args: Callable[..., Any],
@@ -8905,7 +8905,7 @@ class _CollectiveKernel(FallbackKernel):
     @classmethod
     def create_inplace(
         cls,
-        kernel: _OpOverloads,
+        kernel: OpOverloadTypes,
         inputs: Union[IRNode, list[IRNode]],
         *args: Any,
         **kwargs: Any,
@@ -8970,7 +8970,7 @@ class _CollectiveKernel(FallbackKernel):
     @classmethod
     def create_out_of_place(
         cls,
-        kernel: _OpOverloads,
+        kernel: OpOverloadTypes,
         inputs: Union[TensorBox, list[TensorBox]],
         *args: Any,
         **kwargs: Any,
@@ -9031,7 +9031,7 @@ class _AllReduce_Kernel(_CollectiveKernel):
     def __init__(
         self,
         layout: OutputSpec,
-        kernel: _OpOverloads,
+        kernel: OpOverloadTypes,
         tensor_args: Sequence[IRNode],
         nontensor_args: Sequence[Any],
         unflatten_args: Callable[..., Any],
@@ -9062,7 +9062,7 @@ class _AllReduceKernel(_CollectiveKernel):
     def __init__(
         self,
         layout: OutputSpec,
-        kernel: _OpOverloads,
+        kernel: OpOverloadTypes,
         tensor_args: Sequence[IRNode],
         nontensor_args: Sequence[Any],
         unflatten_args: Callable[..., Any],
@@ -9093,7 +9093,7 @@ class _WaitKernel(_CollectiveKernel):
     def __init__(
         self,
         layout: OutputSpec,
-        kernel: _OpOverloads,
+        kernel: OpOverloadTypes,
         tensor_args: Sequence[IRNode],
         nontensor_args: Sequence[Any],
         unflatten_args: Callable[..., Any],
@@ -9144,7 +9144,7 @@ class _WaitKernel(_CollectiveKernel):
             return []
 
     @classmethod
-    def create_wait(cls, kernel: _OpOverloads, inp: TensorBox) -> None:
+    def create_wait(cls, kernel: OpOverloadTypes, inp: TensorBox) -> None:
         with V.graph.fake_mode:
             (
                 _example_output,
