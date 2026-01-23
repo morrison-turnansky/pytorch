@@ -2560,7 +2560,7 @@ class UserDefinedTupleVariable(UserDefinedObjectVariable):
     _nonvar_fields = UserDefinedObjectVariable._nonvar_fields
 
     def __init__(self, value, tuple_vt=None, init_args=None, **kwargs):  # type: ignore[all]
-        from .lists import TupleVariable
+        from .builtin import _create_tuple_from_iterable
 
         tx = kwargs.pop("tx", None)
         super().__init__(value, init_args=init_args, **kwargs)
@@ -2572,13 +2572,12 @@ class UserDefinedTupleVariable(UserDefinedObjectVariable):
             # Emulate `tuple.__new__`
             # https://github.com/python/cpython/blob/3.11/Objects/tupleobject.c#L697-L710
             #
-            # TODO this duplicates the logic in `BuiltinVariable(tuple)`
+            # Uses shared logic with BuiltinVariable(tuple)
             if tx is None:
                 from torch._dynamo.symbolic_convert import InstructionTranslator
 
                 tx = InstructionTranslator.current_tx()
-            elems = init_args[0].force_unpack_var_sequence(tx)
-            self._tuple_vt = TupleVariable(elems, mutation_type=ValueMutationNew())
+            self._tuple_vt = _create_tuple_from_iterable(tx, init_args[0])
         else:
             self._tuple_vt = tuple_vt
 

@@ -281,6 +281,30 @@ def populate_builtin_to_tensor_fn_map() -> None:
                     BUILTIN_TO_TENSOR_RFN_MAP[op] = most_recent_func
 
 
+def _create_tuple_from_iterable(
+    tx: "InstructionTranslator",
+    iterable_var: "VariableTracker",
+) -> "VariableTracker":
+    """
+    Helper function to create a TupleVariable from an iterable VariableTracker.
+
+    This implements the core logic of tuple.__new__ for converting an iterable
+    to a tuple, shared between BuiltinVariable(tuple) and UserDefinedTupleVariable.
+
+    Following CPython's tuple.__new__ implementation:
+    https://github.com/python/cpython/blob/3.11/Objects/tupleobject.c#L697-L710
+
+    Args:
+        tx: The InstructionTranslator context
+        iterable_var: The iterable to convert to tuple elements
+
+    Returns:
+        TupleVariable containing the unpacked elements with ValueMutationNew()
+    """
+    elems = iterable_var.force_unpack_var_sequence(tx)
+    return variables.TupleVariable(elems, mutation_type=ValueMutationNew())
+
+
 class BuiltinVariable(VariableTracker):
     """
     A VariableTracker that represents a built-in value (functions and operators).
@@ -1481,11 +1505,10 @@ class BuiltinVariable(VariableTracker):
                 and not kwargs
             ):
                 if isinstance(args[0], BuiltinVariable) and args[0].fn is tuple:
-                    init_args = args[1].force_unpack_var_sequence(tx)
-                    return variables.TupleVariable(
-                        init_args, mutation_type=ValueMutationNew()
-                    )
+                    # Base tuple case: tuple(tuple, iterable)
+                    return _create_tuple_from_iterable(tx, args[1])
 
+                # Tuple subclass case: tuple(MyTuple, iterable)
                 return tx.output.side_effects.track_new_user_defined_object(
                     self,
                     args[0],
