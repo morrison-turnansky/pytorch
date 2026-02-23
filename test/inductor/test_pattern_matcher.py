@@ -2183,6 +2183,7 @@ class TestPatternMatcherLogging(LoggingTestCase):
 
                 self.assertGreaterEqual(accumulated_count, max(count1, count2))
 
+
 if __name__ == "__main__":
     if IS_LINUX and HAS_GPU:
         run_tests()
