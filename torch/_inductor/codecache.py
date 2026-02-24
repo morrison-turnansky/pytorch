@@ -1290,6 +1290,13 @@ class FxGraphCache(GuardedCache[CompiledFxGraph]):
                 key,
             )
 
+        # Track cache metrics when TORCH_COMPILE_DEBUG=1 (FR2)
+        if os.environ.get("TORCH_COMPILE_DEBUG") == "1":
+            if local_hit or remote_hit:
+                counters["inductor"]["fxgraph_cache_hit"] += 1
+            if local_miss or remote_miss:
+                counters["inductor"]["fxgraph_cache_miss"] += 1
+
     @staticmethod
     def cache_hit_post_compile(
         graph: CompiledFxGraph,
@@ -1669,7 +1676,8 @@ class FxGraphCache(GuardedCache[CompiledFxGraph]):
         }
         if compiled_graph is not None:
             log.info("fx graph cache hit for key %s", key)
-            counters["inductor"]["fxgraph_cache_hit"] += 1
+            if os.environ.get("TORCH_COMPILE_DEBUG") == "1":
+                counters["inductor"]["fxgraph_cache_hit"] += 1
             cache_info["cache_state"] = "hit"
 
             if (time_saved_ns := compiled_graph._time_taken_ns) is not None:
@@ -1686,7 +1694,8 @@ class FxGraphCache(GuardedCache[CompiledFxGraph]):
                     cache_info["ephemeral_timeout_increase"] = ephemeral_increase
         else:
             log.info("fx graph cache miss for key %s", key)
-            counters["inductor"]["fxgraph_cache_miss"] += 1
+            if os.environ.get("TORCH_COMPILE_DEBUG") == "1":
+                counters["inductor"]["fxgraph_cache_miss"] += 1
             cache_info["cache_state"] = "miss"
 
         return compiled_graph, cache_info

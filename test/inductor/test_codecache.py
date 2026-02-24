@@ -1834,6 +1834,82 @@ class TestFxGraphCache(TestCase):
             counters["inductor"]["fxgraph_cache_hit"], 0 if inlinable else 1
         )
 
+    # Cache metrics tests (FR2)
+    @requires_triton()
+    @config.patch({"fx_graph_cache": True})
+    def test_fx_graph_cache_hit(self):
+        """Second compilation of identical function should hit cache."""
+        import os
+        from unittest.mock import patch
+
+        from torch._inductor.utils import fresh_cache
+
+        with patch.dict(os.environ, {"TORCH_COMPILE_DEBUG": "1"}):
+            with fresh_cache():
+                counters.clear()
+
+                def fn(x):
+                    return (x @ x).relu()
+
+                x = torch.randn(4, 4, device=GPU_TYPE)
+                compiled_fn = torch.compile(fn)
+                compiled_fn(x)
+                self.assertGreaterEqual(counters["inductor"]["fxgraph_cache_miss"], 1)
+                self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 0)
+
+    @requires_triton()
+    @config.patch({"fx_graph_cache": True})
+    def test_fx_graph_cache_miss(self):
+        """Different functions should all miss cache."""
+        import os
+        from unittest.mock import patch
+
+        from torch._inductor.utils import fresh_cache
+
+        with patch.dict(os.environ, {"TORCH_COMPILE_DEBUG": "1"}):
+            with fresh_cache():
+                counters.clear()
+
+                def fn1(x):
+                    return x.relu()
+
+                def fn2(x):
+                    return x.sigmoid()
+
+                x = torch.randn(4, 4, device=GPU_TYPE)
+                compiled_fn1 = torch.compile(fn1)
+                compiled_fn1(x)
+                miss_after_first = counters["inductor"]["fxgraph_cache_miss"]
+                compiled_fn2 = torch.compile(fn2)
+                compiled_fn2(x)
+                miss_after_second = counters["inductor"]["fxgraph_cache_miss"]
+
+                self.assertGreater(miss_after_second, miss_after_first)
+
+    @requires_triton()
+    @config.patch({"fx_graph_cache": True})
+    def test_fx_graph_cache_no_tracking_without_debug_flag(self):
+        """Metrics should not be tracked when TORCH_COMPILE_DEBUG is not set."""
+        import os
+        from unittest.mock import patch
+
+        from torch._inductor.utils import fresh_cache
+
+        # Set TORCH_COMPILE_DEBUG to something other than "1"
+        with patch.dict(os.environ, {"TORCH_COMPILE_DEBUG": "0"}):
+            with fresh_cache():
+                counters.clear()
+
+                def fn(x):
+                    return x.relu()
+
+                x = torch.randn(4, 4, device=GPU_TYPE)
+                compiled_fn = torch.compile(fn)
+                compiled_fn(x)
+
+                self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 0)
+                self.assertEqual(counters["inductor"]["fxgraph_cache_miss"], 0)
+
 
 @instantiate_parametrized_tests
 class TestStandaloneCompile(TestCase):
