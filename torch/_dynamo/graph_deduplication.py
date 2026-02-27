@@ -20,6 +20,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from .graph_region_tracker import Node, Region
 from .graph_utils import _detect_cycles, _get_flat_args, _get_flat_args_unique
+from .utils import CompileEventLogger
 
 
 # Represents an index into the region
@@ -69,6 +70,13 @@ when they are created in output_graph.
     )
     node_to_additional_deps = _populate_additional_deps(
         output_graph.graph, output_graph.region_tracker.node_to_mutated_arg_positions
+    )
+
+    num_patterns = len(duplicated_region_groups)
+    total_reuses = sum(len(rg) - 1 for rg in duplicated_region_groups)
+    CompileEventLogger.compilation_metric(
+        subgraph_deduplication_patterns=num_patterns,
+        subgraph_deduplication_reuses=total_reuses,
     )
 
     sub_gms: dict[str, torch.fx.GraphModule] = {}

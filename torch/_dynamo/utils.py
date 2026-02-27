@@ -1480,6 +1480,8 @@ class CompilationMetrics:
     inline_inbuilt_nn_modules_candidate: bool | None = False
     pytorch_version: str | None = None
     inductor_provenance: set[str] | None = None
+    subgraph_deduplication_patterns: int | None = None
+    subgraph_deduplication_reuses: int | None = None
 
     @classmethod
     def create(cls, metrics: dict[str, Any]) -> CompilationMetrics:

@@ -9,6 +9,7 @@ from torch._dynamo.graph_utils import _detect_cycles
 from torch._dynamo.output_graph import FakeRootModule
 from torch._dynamo.test_case import TestCase
 from torch._dynamo.testing import extract_graph, extract_graph_and_tracker, normalize_gm
+from torch._dynamo.utils import get_compilation_metrics
 from torch.compiler import allow_in_graph
 from torch.utils._ordered_set import OrderedSet
 
@@ -1213,6 +1214,56 @@ graph():
             torch._dynamo.mark_static_address(arg)
 
         fn_opt(*args)
+
+    def test_metrics_repeated_blocks(self):
+        """Model with 3 repeated blocks should track patterns."""
+
+        class Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = torch.nn.Parameter(torch.randn(8, 8))
+
+            def forward(self, x):
+                return (x @ self.w).relu()
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block = Block()
+
+            def forward(self, x):
+                y = self.block(x)
+                y = self.block(y)
+                y = self.block(y)
+                return y
+
+        model = Model()
+        x = torch.randn(4, 8)
+        torch.compile(model, backend="eager")(x)
+
+        # Read from CompilationMetrics
+        metrics = get_compilation_metrics()[-1]
+        patterns = metrics.subgraph_deduplication_patterns or 0
+        reuses = metrics.subgraph_deduplication_reuses or 0
+        self.assertEqual(patterns, 1, "Should find patterns")
+        self.assertEqual(reuses, 1, "Should have reuses")
+
+    def test_metrics_no_patterns(self):
+        """Model with no repetition should show zero patterns."""
+
+        def model(x):
+            return (x + 1).relu()
+
+        x = torch.randn(4, 4)
+        torch.compile(model, backend="eager")(x)
+
+        # Read from CompilationMetrics
+        metrics = get_compilation_metrics()[-1]
+        patterns = metrics.subgraph_deduplication_patterns or 0
+        reuses = metrics.subgraph_deduplication_reuses or 0
+
+        self.assertEqual(patterns, 0, "Should find no patterns")
+        self.assertEqual(reuses, 0, "Should have no reuses")
 
 
 if __name__ == "__main__":
