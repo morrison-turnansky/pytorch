@@ -384,6 +384,9 @@ def user_defined_triton_kernel_transitive_closure_source_code(
                     else:
                         compile_wrapper.writeline(f"{symbol_name} = {symbol_str}")
                     symbols_included.add(symbol_name)
+                elif isinstance(symbol, triton.language.dtype):
+                    compile_wrapper.writeline(f"{symbol_name} = tl.{symbol}")
+                    symbols_included.add(symbol_name)
                 elif (
                     symbol_name in unqualified_loads
                     and symbol_name != "tl"  # already imported
