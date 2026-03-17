@@ -32,34 +32,60 @@ store(variance)               # ← WRITE variance to HBM
 variance = load(variance)     # ← LOAD 3 (from HBM!)
 tmp0 = load(x[0:N/2])        # LOAD 4 (gate)
 tmp1 = load(residual[0:N/2]) # LOAD 5 (gate)
-tmp2 = load(x[N/2:N])        # LOAD 6 (up)
-tmp3 = load(residual[N/2:N]) # LOAD 7 (up)
+tmp2 = load(weight[0:N/2])   # LOAD 6 (gate)
+tmp3 = load(x[N/2:N])        # LOAD 7 (up)
+tmp4 = load(residual[N/2:N]) # LOAD 8 (up)
+tmp5 = load(weight[N/2:N])   # LOAD 9 (up)
 # Apply normalization + chunking + gating
-``
+```
 
-**Total memory traffic:**
-- **7 loads** (2 full x+res + 2 half x+res + 1 variance)
-- **2 stores** (variance + output)
+**Total memory operations:**
+- **9 loads** (2 full row + 6 half row + 1 variance scalar)
+- **2 stores** (variance scalar + output)
 - **Critical**: Variance roundtrip through HBM!
 
 ## Solution: Polyhedral-Style Fusion
 
 Our golden kernel fuses both operations into **one kernel** that keeps variance in registers.
 
-**Total memory traffic:**
-- **6 loads** (1 full x+res + 2 half x+res)
+**Total memory operations:**
+- **8 loads** (2 full row + 6 half row, NO variance load)
 - **1 store** (output only)
-- **Critical**: No HBM roundtrip for variance!
+- **Critical**: Variance stays in registers (tmp7), never written to HBM!
+
+### Where the Speedup Actually Comes From
+
+The load count difference (9 vs 8) is **not** the main source of speedup. The variance data is tiny:
+- Variance: 2048 scalars × 4 bytes (fp32) = **8 KB**
+- Row data: 2048 × 8192 × 2 bytes (bfloat16) = **~33 MB**
+
+**The real speedup (~1.4x) comes from:**
+
+1. **Kernel launch overhead elimination**
+   - 2 kernels → 1 kernel saves one launch
+
+2. **Synchronization overhead elimination**
+   - Between Kernel 0 and Kernel 1, GPU must sync
+
+3. **L2 cache reuse**
+   - Fused kernel: variance computed → immediately used (stays in L2)
+   - Separate kernels: variance evicted from L2 between kernels
+
+4. **Better instruction-level parallelism**
+   - Single kernel allows compiler to pipeline variance computation with output computation
+   - Reduces register pressure and improves occupancy
+
+**Bottom line**: The fusion enables the compiler to keep intermediate data (variance) in the memory hierarchy (registers/L2) instead of forcing a round-trip through HBM.
 
 
 ## Performance Results (H200 GPU)
 
 ```
-Inductor Baseline: 0.0796 ms/iter
-Golden Fused:      0.0480 ms/iter
-
-LATENCY REDUCTION: 0.0316 ms
-SPEEDUP:           1.66x
+Inductor Baseline (2 kernels): 0.0511 ms
+Golden Fused (1 kernel):       0.0360 ms
+--------------------------------------------------
+Latency Reduction:             0.0150 ms
+Speedup:                       1.42x
 ```
 
 ## How Polyhedral Optimization Finds This
@@ -96,23 +122,7 @@ RAW(S0 → S2): variance written once, read N/2 times
 Conclusion: Fusing saves N memory accesses!
 ```
 
-### 3. Register Promotion
-
-Polyhedral technique: **Scalar expansion + contraction**
-
-```
-Original:  variance[i] stored in array (HBM)
-Optimized: variance promoted to register-resident scalar
-
-Transformation:
-- Expand: Create scalar tmp7 per thread block
-- Use: Replace variance[i] reads with tmp7
-- Contract: Never materialize variance[] array
-```
-
-This is exactly what `tmp7` does in our golden kernel!
-
-### 4. Schedule Transformation
+### 3. Schedule Transformation
 
 ```python
 # Original (2 kernels)

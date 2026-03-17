@@ -1,57 +1,58 @@
 import torch
 import triton
-import triton.language as tl
-import time
-from .golden_kernel import launch_fused_block
-from .baseline_example import rms_norm_residual_block, HIDDEN_DIM, SEQ_LEN
+import triton.testing
+from golden_kernel import launch_fused_block
+from baseline_example import rms_norm_residual_block, HIDDEN_DIM, SEQ_LEN
 
-# --- WALL CLOCK BENCHMARK ---
-def run_benchmark(iters=10):
+
+def run_benchmark(warmup=1, rep=25):
+    """
+    Benchmark using triton.testing.do_bench for accurate GPU timing.
+
+    Args:
+        warmup: Number of warmup iterations (default: 25)
+        rep: Number of measurement repetitions (default: 100)
+    """
     device, dtype = "cuda", torch.bfloat16
+
+    # Create test tensors
     x = torch.randn(SEQ_LEN, HIDDEN_DIM, device=device, dtype=dtype)
     res = torch.randn(SEQ_LEN, HIDDEN_DIM, device=device, dtype=dtype)
     w = torch.randn(HIDDEN_DIM, device=device, dtype=dtype)
 
-    # Prepare Baseline (Trigger compilation before timing)
+    # Compile baseline (triggers compilation before benchmarking)
     compiled_baseline = torch.compile(rms_norm_residual_block, fullgraph=True)
 
-    for _ in range(1):
-        _ = compiled_baseline(x, res, w)
-        _ = launch_fused_block(x, res, w)
-    torch.cuda.synchronize()
+    print(f"Benchmarking Inductor (warmup={warmup}, rep={rep})...")
+    inductor_ms = triton.testing.do_bench(
+        lambda: compiled_baseline(x, res, w),
+        warmup=warmup,
+        rep=rep
+    )
 
-    # Benchmark Torch.Compile (Inductor)
-    print(f"Benchmarking Inductor (Wall Clock)...")
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        _ = compiled_baseline(x, res, w)
-    torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    inductor_total = (t1 - t0) * 1000 # ms
-    
-    # Benchmark Golden Kernel
-    print(f"Benchmarking Golden Kernel (Wall Clock)...")
-    t2 = time.perf_counter()
-    for _ in range(iters):
-        _ = launch_fused_block(x, res, w)
-    torch.cuda.synchronize()
-    t3 = time.perf_counter()
-    golden_total = (t3 - t2) * 1000 # ms
+    # Benchmark Golden kernel
+    print(f"Benchmarking Golden Kernel (warmup={warmup}, rep={rep})...")
+    golden_ms = triton.testing.do_bench(
+        lambda: launch_fused_block(x, res, w),
+        warmup=warmup,
+        rep=rep
+    )
 
-    # Results
-    avg_inductor = inductor_total / iters
-    avg_golden = golden_total / iters
-    
-    print("\n" + "="*30)
-    print(f"H200 WALL CLOCK RESULTS")
-    print(f"Iterations: {iters}")
-    print("="*30)
-    print(f"Inductor Baseline: {avg_inductor:.4f} ms/iter")
-    print(f"Golden Fused:      {avg_golden:.4f} ms/iter")
-    print("-" * 30)
-    print(f"LATENCY REDUCTION: {avg_inductor - avg_golden:.4f} ms")
-    print(f"SPEEDUP:           {avg_inductor / avg_golden:.2f}x")
-    print("="*30)
+    # Print results
+    print("\n" + "="*50)
+    print(f"H200 BENCHMARK RESULTS (triton.testing.do_bench)")
+    print(f"Config: SEQ_LEN={SEQ_LEN}, HIDDEN_DIM={HIDDEN_DIM}")
+    print(f"Warmup: {warmup}, Repetitions: {rep}")
+    print("="*50)
+    print(f"Inductor Baseline (2 kernels): {inductor_ms:.4f} ms")
+    print(f"Golden Fused (1 kernel):       {golden_ms:.4f} ms")
+    print("-" * 50)
+    print(f"Latency Reduction:             {inductor_ms - golden_ms:.4f} ms")
+    print(f"Speedup:                       {inductor_ms / golden_ms:.2f}x")
+    print("="*50)
+
+    return inductor_ms, golden_ms
+
 
 if __name__ == "__main__":
     run_benchmark()

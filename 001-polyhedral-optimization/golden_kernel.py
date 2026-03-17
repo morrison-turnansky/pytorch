@@ -70,24 +70,23 @@ def triton_fused_rmsnorm_residual_gating_0(
     #   up = normed(x[i+half] + res[i+half])
     #   output[i] = silu(gate) * up
 
-    # out_index: indices for output (first half)
-    out_index = tl.arange(0, RBLOCK)
-    out_mask = out_index < half_rnumel
+    # out_index: indices for output (only half the elements)
+    # Use RBLOCK // 2 to avoid wasted threads
+    out_index = tl.arange(0, RBLOCK // 2)
 
-    # Load gate part (first half)
-    tmp8 = tl.load(in_ptr0 + row_start + out_index, mask=out_mask, other=0.0).to(tl.float32)
-    tmp9 = tl.load(in_ptr1 + row_start + out_index, mask=out_mask, other=0.0).to(tl.float32)
-    tmp10 = tl.load(in_ptr2 + out_index, mask=out_mask, other=0.0).to(tl.float32)
+    # Load gate part (first half: 0 to half_rnumel-1)
+    tmp8 = tl.load(in_ptr0 + row_start + out_index).to(tl.float32)
+    tmp9 = tl.load(in_ptr1 + row_start + out_index).to(tl.float32)
+    tmp10 = tl.load(in_ptr2 + out_index).to(tl.float32)
 
     # gate: (x_gate + res_gate) * rsqrt_var * w_gate
     tmp11 = (tmp8 + tmp9) * tmp7 * tmp10
 
-    # Load up part (second half, shifted)
+    # Load up part (second half: half_rnumel to rnumel-1)
     up_index = out_index + half_rnumel
-    up_mask = up_index < rnumel
-    tmp12 = tl.load(in_ptr0 + row_start + up_index, mask=up_mask, other=0.0).to(tl.float32)
-    tmp13 = tl.load(in_ptr1 + row_start + up_index, mask=up_mask, other=0.0).to(tl.float32)
-    tmp14 = tl.load(in_ptr2 + up_index, mask=up_mask, other=0.0).to(tl.float32)
+    tmp12 = tl.load(in_ptr0 + row_start + up_index).to(tl.float32)
+    tmp13 = tl.load(in_ptr1 + row_start + up_index).to(tl.float32)
+    tmp14 = tl.load(in_ptr2 + up_index).to(tl.float32)
 
     # up: (x_up + res_up) * rsqrt_var * w_up
     tmp15 = (tmp12 + tmp13) * tmp7 * tmp14
@@ -98,7 +97,7 @@ def triton_fused_rmsnorm_residual_gating_0(
 
     # Store output
     output_offset = xindex * half_rnumel
-    tl.store(out_ptr0 + output_offset + out_index, tmp17, mask=out_mask)
+    tl.store(out_ptr0 + output_offset + out_index, tmp17)
 
 
 def launch_fused_block(arg0_1, arg1_1, arg2_1):
