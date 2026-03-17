@@ -71,10 +71,6 @@ The load count difference (9 vs 8) is **not** the main source of speedup. The va
    - Fused kernel: variance computed → immediately used (stays in L2)
    - Separate kernels: variance evicted from L2 between kernels
 
-4. **Better instruction-level parallelism**
-   - Single kernel allows compiler to pipeline variance computation with output computation
-   - Reduces register pressure and improves occupancy
-
 **Bottom line**: The fusion enables the compiler to keep intermediate data (variance) in the memory hierarchy (registers/L2) instead of forcing a round-trip through HBM.
 
 
