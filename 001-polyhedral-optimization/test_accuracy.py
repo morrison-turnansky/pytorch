@@ -3,6 +3,9 @@ Test accuracy of torch implementation from baseline_example and golden kernel
 """
 import torch
 import pytest
+from torch._inductor.utils import run_and_get_code
+from torch.testing import FileCheck
+
 from baseline_example import rms_norm_residual_block, HIDDEN_DIM, SEQ_LEN
 from golden_kernel import launch_fused_block
 
@@ -141,34 +144,19 @@ def test_golden_kernel_correctness_detailed():
     print(f"  Output range: [{golden_output.min().item():.3f}, {golden_output.max().item():.3f}]")
 
 
-if __name__ == "__main__":
-    print("Running accuracy tests...\n")
+def test_fusion_codegen():
+    """
+    Verify fusion status by inspecting generated Triton code.
+    Current baseline: 2 kernels (unfused)
+    Future with polyhedral fusion: 1 kernel (fused)
+    """
 
-    try:
-        print("=" * 60)
-        print("Test 1: Torch Kernel (Eager vs Compiled)")
-        print("=" * 60)
-        test_torch_kernel()
-        print()
+    x = torch.randn(SEQ_LEN, HIDDEN_DIM, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(SEQ_LEN, HIDDEN_DIM, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(HIDDEN_DIM, device="cuda", dtype=torch.bfloat16)
 
-        print("=" * 60)
-        print("Test 2: Golden Kernel vs Baseline")
-        print("=" * 60)
-        test_golden_kernel()
-        print()
+    compiled_fn = torch.compile(rms_norm_residual_block, fullgraph=True)
+    _, source_codes = run_and_get_code(compiled_fn, x, residual, weight)
 
-        print("=" * 60)
-        print("Test 3: Golden Kernel Detailed Correctness")
-        print("=" * 60)
-        test_golden_kernel_correctness_detailed()
-        print()
-
-        print("=" * 60)
-        print("✓ ALL TESTS PASSED!")
-        print("=" * 60)
-
-    except Exception as e:
-        print(f"\n✗ TEST FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        exit(1)
+    # Current baseline: 2 kernels (unfused)
+    FileCheck().check_count("@triton.jit", 2, exactly=True).run(source_codes[0])
