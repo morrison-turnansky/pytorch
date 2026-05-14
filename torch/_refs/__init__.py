@@ -1985,6 +1985,10 @@ def addcmul(
 ) -> TensorLikeType:
     """
     Reference implementation of torch.addcmul
+
+    On CPU with floating-point types, we avoid decomposition to match ATen's
+    native kernel which computes the expression as a single C++ statement,
+    ensuring bitwise-identical FP contraction behavior.
     """
     if value is not None:
         dtype = self.dtype  # no scalars allowed, see add
@@ -1993,6 +1997,13 @@ def addcmul(
             utils.is_weakly_lesser_type(type(value), python_type),
             lambda: f"value argument of type {type(value)} cannot be safely cast to type {python_type}!",
         )
+
+    # On CPU with floating-point, skip decomposition for bitwise-exact numerics
+    if (
+        self.device.type == "cpu"
+        and self.dtype.is_floating_point
+    ):
+        return aten.addcmul.default(self, tensor1, tensor2, value=value)
 
     return self + value * tensor1 * tensor2
 

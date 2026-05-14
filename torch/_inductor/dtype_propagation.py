@@ -300,6 +300,13 @@ class DtypePropagationOpsHandler:
         return promote_types([a, b])
 
     @staticmethod
+    def addcmul_cpu(
+        self_val: DTypeArg, t1_val: DTypeArg, t2_val: DTypeArg, value_val: DTypeArg
+    ) -> torch.dtype:
+        # Promotes self, tensor1, tensor2 with DEFAULT type promotion
+        return promote_types([self_val, t1_val, t2_val])
+
+    @staticmethod
     def indirect_indexing(
         x: DTypeArg, size: int, check: bool = True, wrap_neg: bool = True
     ) -> torch.dtype:

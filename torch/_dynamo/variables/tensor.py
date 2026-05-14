@@ -1701,6 +1701,26 @@ class TensorVariable(VariableTracker):
         if value is not None and config.enable_dynamo_decompositions:
             from torch._inductor import inductor_prims
 
+            #  Skip decomposition on CPU with floating-point for bitwise-exact numerics
+            # (GitHub issue #176929)
+            if (
+                self.device is not None
+                and self.dtype is not None
+                and self.device.type == "cpu"
+                and self.dtype.is_floating_point
+            ):
+                # Call native addcmul through graph instead of decomposing
+                # If value is a 0-d tensor, extract scalar with .item()
+                if isinstance(value, TensorVariable):
+                    # Call .item() to get scalar value
+                    value_scalar = value.call_method(tx, "item", [], {})
+                else:
+                    value_scalar = value
+
+                addcmul_var = variables.TorchInGraphFunctionVariable(torch.ops.aten.addcmul.default)
+                result = addcmul_var.call_function(tx, [self, tensor1, tensor2], {"value": value_scalar})
+                return self.call_method(tx, "copy_", [result], {})
+
             mul_var = variables.TorchInGraphFunctionVariable(torch.mul)
             fma_var = variables.TorchInGraphFunctionVariable(inductor_prims.fma)
             product = mul_var.call_function(tx, [tensor1, tensor2], {})

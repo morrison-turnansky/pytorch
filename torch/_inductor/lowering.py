@@ -7683,6 +7683,9 @@ def addcmul(self, tensor1, tensor2, *, value=1):
     to force rounding of the product before the FMA. This prevents Triton's
     compiler from fusing the multiplication with the FMA, matching eager's
     rounding behavior.
+
+    For CPU floating-point types, we use FallbackKernel to call ATen's native
+    implementation directly, ensuring bitwise-identical FP contraction behavior.
     """
     dtype = get_promoted_dtype(
         self,
@@ -7691,12 +7694,23 @@ def addcmul(self, tensor1, tensor2, *, value=1):
         type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
     )
 
+    device = self.get_device()
+
+    # CPU floating-point: use native ATen kernel for bitwise-exact numerics (issue #176929)
+    if (
+        dtype.is_floating_point
+        and device is not None
+        and device.type == "cpu"
+    ):
+        return TensorBox.create(
+            ir.FallbackKernel.create(aten.addcmul.default, self, tensor1, tensor2, value=value)
+        )
+
     self_loader = self.make_loader()
     t1_loader = tensor1.make_loader()
     t2_loader = tensor2.make_loader()
 
     # FMA/mul_rn/div_rn are only available for floating-point types on CUDA (non-AMD)
-    device = self.get_device()
     use_fma = (
         dtype.is_floating_point
         and not torch.version.hip
@@ -7712,6 +7726,12 @@ def addcmul(self, tensor1, tensor2, *, value=1):
         if value == 1 and use_fma:
             return ops.fma(t1_val, t2_val, self_val)
 
+        # Use index_expr for sympy expressions (e.g., from .item()), constant otherwise
+        if isinstance(value, sympy.Basic):
+            value_expr = ops.index_expr(value, dtype)
+        else:
+            value_expr = ops.constant(value, dtype)
+
         # Match eager order: self + value * (tensor1 * tensor2)
         # Compute tensor1 * tensor2 first
         if use_fma:
@@ -7720,12 +7740,6 @@ def addcmul(self, tensor1, tensor2, *, value=1):
             t1_times_t2 = ops.mul_rn(t1_val, t2_val)
         else:
             t1_times_t2 = ops.mul(t1_val, t2_val)
-
-        # Use index_expr for sympy expressions (e.g., from .item()), constant otherwise
-        if isinstance(value, sympy.Basic):
-            value_expr = ops.index_expr(value, dtype)
-        else:
-            value_expr = ops.constant(value, dtype)
 
         if use_fma:
             # Use FMA for floating-point types for better precision
