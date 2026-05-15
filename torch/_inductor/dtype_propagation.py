@@ -273,6 +273,12 @@ class DtypePropagationOpsHandler:
         return promote_types([a, b])
 
     @staticmethod
+    def addcmul_fused(
+        self_val: DTypeArg, value_val: DTypeArg, t1_val: DTypeArg, t2_val: DTypeArg
+    ) -> torch.dtype:
+        return promote_types([self_val, value_val, t1_val, t2_val])
+
+    @staticmethod
     def truediv(a: DTypeArg, b: DTypeArg) -> torch.dtype:
         return promote_types([a, b])
 

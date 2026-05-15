@@ -7679,13 +7679,10 @@ def addcmul(self, tensor1, tensor2, *, value=1):
     Note: FMA is only used for floating-point types on non-AMD GPUs. For integer types,
     we fall back to regular arithmetic since FMA doesn't support integers.
 
-    For floating-point types, we use mul_rn (round-to-nearest multiplication)
+    For floating-point types on CUDA, we use mul_rn (round-to-nearest multiplication)
     to force rounding of the product before the FMA. This prevents Triton's
     compiler from fusing the multiplication with the FMA, matching eager's
     rounding behavior.
-
-    For CPU floating-point types, we use FallbackKernel to call ATen's native
-    implementation directly, ensuring bitwise-identical FP contraction behavior.
     """
     dtype = get_promoted_dtype(
         self,
@@ -7695,16 +7692,6 @@ def addcmul(self, tensor1, tensor2, *, value=1):
     )
 
     device = self.get_device()
-
-    # CPU floating-point: use native ATen kernel for bitwise-exact numerics (issue #176929)
-    if (
-        dtype.is_floating_point
-        and device is not None
-        and device.type == "cpu"
-    ):
-        return TensorBox.create(
-            ir.FallbackKernel.create(aten.addcmul.default, self, tensor1, tensor2, value=value)
-        )
 
     self_loader = self.make_loader()
     t1_loader = tensor1.make_loader()
@@ -7731,6 +7718,11 @@ def addcmul(self, tensor1, tensor2, *, value=1):
             value_expr = ops.index_expr(value, dtype)
         else:
             value_expr = ops.constant(value, dtype)
+
+        # For CPU vectorized path, emit single expression to avoid temporaries
+        if device is not None and device.type == "cpu" and dtype.is_floating_point:
+            # Use custom fused operation that emits single C++ expression
+            return ops.addcmul_fused(self_val, value_expr, t1_val, t2_val)
 
         # Match eager order: self + value * (tensor1 * tensor2)
         # Compute tensor1 * tensor2 first
@@ -8062,6 +8054,8 @@ def register_inplace(aten_op, outplace_op):
 
 
 register_inplace(aten.add_, add)
+register_inplace(aten.addcmul_, addcmul)
+register_inplace(aten.addcdiv_, addcdiv)
 register_inplace(aten.bitwise_and_, bitwise_and)
 register_inplace(aten.bitwise_left_shift_, bitwise_left_shift)
 register_inplace(aten.bitwise_not_, bitwise_not)

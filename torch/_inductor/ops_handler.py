@@ -577,6 +577,10 @@ class OpsHandler(Generic[T]):
         """Multiplication with round-to-nearest, preventing fusion with subsequent ops."""
         raise NotImplementedError
 
+    def addcmul_fused(self, self_val: T, value_val: T, t1_val: T, t2_val: T) -> T:
+        """Computes self + value * t1 * t2 as a single expression."""
+        raise NotImplementedError
+
     def igamma(self, x: T, y: T) -> T:
         raise NotImplementedError
 

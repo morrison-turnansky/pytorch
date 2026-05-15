@@ -979,14 +979,6 @@ class OpDecompositions:
     def round_to_int(a: OpVarT, dtype: torch.dtype) -> OpVarT:
         return ops.to_dtype(ops.round(a), dtype)
 
-    @staticmethod
-    def addcmul_cpu(
-        self_val: OpVarT, t1_val: OpVarT, t2_val: OpVarT, value_val: OpVarT
-    ) -> OpVarT:
-        # Default fallback for backends that don't override this
-        # CppOverrides provides the optimized single-expression version
-        return ops.add(self_val, ops.mul(value_val, ops.mul(t1_val, t2_val)))
-
 
 _RE_PAREN_NOT_NEEDED = re.compile(r"[a-z0-9_.]+|\([^)]*\)|", flags=re.IGNORECASE)
 

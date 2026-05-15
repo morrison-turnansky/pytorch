@@ -703,6 +703,11 @@ class CppOverrides(OpOverrides):
         return f"{decltype_promoted(a, b)}({a} * {b})"
 
     @staticmethod
+    def addcmul_fused(self_val, value_val, t1_val, t2_val):
+        """Generate single-expression C++ for: self + value * t1 * t2"""
+        return f"decltype({self_val})({self_val} + {value_val} * {t1_val} * {t2_val})"
+
+    @staticmethod
     def to_dtype(x, dtype, src_dtype=None, use_compute_types=True):
         assert isinstance(x, CppCSEVariable)
         if src_dtype is None:
@@ -1188,18 +1193,6 @@ class CppOverrides(OpOverrides):
         code.writeline("()")
         return code
 
-    @staticmethod
-    def addcmul_cpu(self_val, t1_val, t2_val, value_val):
-        """
-        CPU-specific addcmul implementation that emits a single C++ expression.
-        Computes: self + value * tensor1 * tensor2
-
-        This matches ATen's CPU kernel which uses a single expression, allowing
-        the compiler to choose FP contraction strategy identically to eager mode.
-        """
-        # Single C++ expression - compiler chooses FP contraction
-        return f"({self_val} + {value_val} * {t1_val} * {t2_val})"
-
     def partial_accumulate(
         self,
         name: str,
@@ -1324,6 +1317,11 @@ class CppVecOverrides(CppOverrides):
     @staticmethod
     def truediv(a, b):
         return f"{a} / {b}"
+
+    @staticmethod
+    def addcmul_fused(self_val, value_val, t1_val, t2_val):
+        """Generate single-expression C++ for: self + value * t1 * t2"""
+        return f"{self_val} + {value_val} * {t1_val} * {t2_val}"
 
     @staticmethod
     def abs(x):
