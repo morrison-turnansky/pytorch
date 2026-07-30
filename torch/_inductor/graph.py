@@ -2095,8 +2095,22 @@ class GraphLowering(torch.fx.Interpreter):
                 and isinstance(result, TensorBox)
                 and isinstance(result.data, ir.BaseView)
             ):
-                # Realize so that outputs are correctly aliased
-                result.realize()
+                if config.polyhedral_fusion and self.is_inference:
+                    # Create a contiguous copy of the view rather than
+                    # realizing the underlying tensor.  This keeps
+                    # normalization chains unrealized so post-chunk nodes
+                    # can inline them and read scalar reduction outputs
+                    # from registers (polyhedral fusion).
+                    result = TensorBox(ir.Pointwise.create(
+                        device=result.get_device(),
+                        dtype=result.get_dtype(),
+                        inner_fn=result.make_loader(),
+                        ranges=result.get_size(),
+                    ))
+                    result.realize()
+                else:
+                    # Realize so that outputs are correctly aliased
+                    result.realize()
 
             if (is_output or is_input_for_as_strided) and isinstance(
                 n.meta.get("val"), torch.Tensor

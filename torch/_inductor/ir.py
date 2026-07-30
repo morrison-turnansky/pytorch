@@ -10740,7 +10740,15 @@ class StorageBox(MutableBox):
                     return True
             if self.has_large_inner_fn():
                 return True
-            return graph_reuse and self.num_reads() > config.realize_reads_threshold
+            threshold = config.realize_reads_threshold
+            # When polyhedral fusion is enabled, allow more reads before
+            # realizing. This keeps normalization chains unrealized so
+            # post-chunk Pointwise nodes can inline the normalization and
+            # read scalar reduction outputs from registers (the same
+            # mechanism that makes RMSNorm + chunk work).
+            if config.polyhedral_fusion and V.graph.is_inference:
+                threshold = max(threshold, 8)
+            return graph_reuse and self.num_reads() > threshold
         return False
 
     def mark_reuse(self, users: int, *, graph_reuse: bool = True) -> None:
