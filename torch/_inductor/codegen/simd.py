@@ -2453,9 +2453,10 @@ class SIMDScheduling(BaseScheduling):
         if len(shift) == 0:
             return False
 
-        # todo: Shift does not need to be 0 in general.
-        # This check will be removed in next phase of implementation.
-        return all(v == 0 for v in shift.values())
+        # Accept any non-negative shift: the consumer's domain is a
+        # structural subset of the producer's domain.
+        sv = V.graph.sizevars
+        return all(sv.statically_known_leq(0, v) for v in shift.values())
 
     def generate_node_schedule(self, nodes, numel, rnumel):
         """Order nodes into a linear schedule with reduction/pointwise loop markers."""

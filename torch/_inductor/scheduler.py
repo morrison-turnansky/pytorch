@@ -8325,13 +8325,26 @@ class Scheduler:
             for dep in itertools.chain.from_iterable(remaining_deps_by_name.values())
         )
 
-        if remaining_deps & node1_buf_names:
+        mismatched_deps = remaining_deps & node1_buf_names
+        if mismatched_deps:
             # MemoryDeps didn't match and read different locations of the same buffer.
-            # Examples here include:
-            #   - MemoryDep("foo", x) != MemoryDep("foo", x + 1)
-            #   - MemoryDep("foo", x) != StarDep("foo")
-            why("memory deps did not match")
-            return False
+            # With polyhedral fusion, accept structural-subset reads: the consumer
+            # iterates over a subset of the producer's range (e.g. after split/chunk).
+            if (
+                config.polyhedral_fusion
+                and V.graph.is_inference
+                and self._polyhedral_deps_are_subsets(
+                    node1, node2, mismatched_deps, remaining_deps_by_name
+                )
+            ):
+                # Clear the resolved deps so they don't trigger the
+                # "intermediate nodes" check below.
+                for dep_name in mismatched_deps:
+                    remaining_deps_by_name.pop(dep_name, None)
+                remaining_deps -= mismatched_deps
+            else:
+                why("memory deps did not match")
+                return False
 
         node1_op_names = node1.get_operation_names()
         for name in remaining_deps:
@@ -8340,6 +8353,42 @@ class Scheduler:
                 why("intermediate nodes between node1 & node2")
                 return False
 
+        return True
+
+    def _polyhedral_deps_are_subsets(
+        self,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+        mismatched_deps: OrderedSet[str],
+        remaining_deps_by_name: dict[str, list[Dep]],
+    ) -> bool:
+        """Check that all mismatched deps are structural subsets for polyhedral fusion."""
+        from .codegen.simd import SIMDScheduling
+
+        backend = self.get_backend(node1.get_device())
+        # CUDACombinedScheduling wraps the triton SIMD scheduling
+        simd_backend = getattr(backend, "_triton_scheduling", backend)
+        if not isinstance(simd_backend, SIMDScheduling):
+            return False
+        if not simd_backend.supports_polyhedral:
+            return False
+
+        node1_writes = {
+            self.mutation_renames.get(w.name, w.name): w
+            for w in node1.read_writes.writes
+            if isinstance(w, MemoryDep)
+        }
+
+        for dep_name in mismatched_deps:
+            write_dep = node1_writes.get(dep_name)
+            if write_dep is None:
+                return False
+            read_deps = remaining_deps_by_name.get(dep_name, [])
+            for rd in read_deps:
+                if not isinstance(rd, MemoryDep):
+                    return False
+                if not simd_backend._check_index_compatibility(write_dep, rd):
+                    return False
         return True
 
     def fusable_weak_dep(

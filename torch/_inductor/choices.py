@@ -634,7 +634,21 @@ class InductorChoices:
             - config.triton.tiling_prevents_reduction_fusion
             - config.aggressive_fusion (will cause this function to be called more times)
         """
-        if shared_data_score == 0 and (
+        # When polyhedral fusion is enabled, allow reduction + pointwise pairs
+        # with an ancestor relationship to bypass the shared-data heuristic.
+        # The benefit is keeping reduction results in registers rather than
+        # eliminating a shared buffer, so shared_data_score can legitimately be 0.
+        polyhedral_bypass = (
+            config.polyhedral_fusion
+            and V.graph.is_inference
+            and (node1.is_reduction() or node2.is_reduction())
+            and not (node1.is_reduction() and node2.is_reduction())
+            and bool(
+                node1.get_operation_names() & node2.ancestors
+                or node2.get_operation_names() & node1.ancestors
+            )
+        )
+        if shared_data_score == 0 and not polyhedral_bypass and (
             not config.aggressive_fusion or node1.is_reduction() or node2.is_reduction()
         ):
             if is_metric_table_enabled("fusion_failure_due_to_indexing_mismatch"):
