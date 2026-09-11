@@ -2449,6 +2449,13 @@ class _SubParentValueResolver(WrapperHandler):  # type: ignore[type-arg]
         )
         consumer_lanes: dict[MemoryDep, int] = {}
         for relation in access_relations:
+            if (
+                relation.mapping_kind
+                is scheduler.SubParentAccessKind.IDENTITY_TRANSLATION
+            ):
+                raise AssertionError(
+                    "translation-aware sub-parent replay is not implemented"
+                )
             if relation.parent_lane is not None:
                 consumer = relation.consumer_access.normalize()
                 prior_lane = consumer_lanes.setdefault(consumer, relation.parent_lane)
@@ -2810,6 +2817,14 @@ class SIMDScheduling(BaseScheduling):
     kernel_type: type[Any] = SIMDKernel  # override in subclass
     supports_sub_parent_epilogue = False
 
+    @staticmethod
+    def _is_standalone_staged_reduction(
+        node: scheduler.BaseSchedulerNode,
+    ) -> bool:
+        return isinstance(node, scheduler.FusedStagedReduction) and not isinstance(
+            node, scheduler.FusedNestedReductions
+        )
+
     def group_fn(self, sizes):
         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
 
@@ -3001,12 +3016,12 @@ class SIMDScheduling(BaseScheduling):
                 if not ordinary_fusion:
                     why("nodes numel incompatibility")
 
-            if ordinary_fusion and type(node2) is not scheduler.FusedStagedReduction:
+            if ordinary_fusion and not self._is_standalone_staged_reduction(node2):
                 return True
 
             if (
                 node2.get_operation_names() & node1.ancestors
-                or type(node2) is scheduler.FusedStagedReduction
+                or self._is_standalone_staged_reduction(node2)
             ):
                 sub_parent_fusion = self._sub_parent_epilogue_decision(node1, node2)
                 if sub_parent_fusion is _SubParentFusion.REJECT:
@@ -3014,7 +3029,7 @@ class SIMDScheduling(BaseScheduling):
                     return False
                 if sub_parent_fusion is _SubParentFusion.FUSE:
                     return True
-            if type(node2) is scheduler.FusedStagedReduction:
+            if self._is_standalone_staged_reduction(node2):
                 why("staged reduction plan would be lost")
                 return False
             return ordinary_fusion
@@ -3092,7 +3107,7 @@ class SIMDScheduling(BaseScheduling):
         stage = plan.sub_parent_stages[0]
         epilogue_nodes = stage.epilogue_nodes
         epilogue_node_set = OrderedSet(epilogue_nodes)
-        if type(reduction_node) is scheduler.FusedStagedReduction:
+        if self._is_standalone_staged_reduction(reduction_node):
             return _SubParentFusion.FUSE
         return (
             _SubParentFusion.FUSE
@@ -3601,7 +3616,7 @@ class SIMDScheduling(BaseScheduling):
                 raise AssertionError("nested reduction plan was lost before codegen")
             return self._codegen_nested_reduction(node, plan)
 
-        if not isinstance(node, scheduler.FusedStagedReduction):
+        if not self._is_standalone_staged_reduction(node):
             raise AssertionError(f"unexpected staged reduction type: {type(node)}")
         nodes = [
             sn
