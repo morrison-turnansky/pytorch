@@ -1111,6 +1111,14 @@ class NestedReduction:
         )
         if broadcast_relations is None:
             return None
+        access_relations = (
+            *source_relations,
+            *broadcast_relations,
+            *internal_relations,
+            *output_relations,
+        )
+        if not cls._sub_parent_relations_are_replay_compatible(access_relations):
+            return None
         planned_source_names = OrderedSet(
             relation.source_accesses[0].name
             for relation in (*source_relations, *output_relations)
@@ -1135,12 +1143,7 @@ class NestedReduction:
             sub_parent_stages=(
                 SubParentEpilogueStage(
                     factor=sub_parent_factor,
-                    access_relations=(
-                        *source_relations,
-                        *broadcast_relations,
-                        *internal_relations,
-                        *output_relations,
-                    ),
+                    access_relations=access_relations,
                     output_groups=output_groups,
                 ),
             ),
@@ -2575,15 +2578,57 @@ class NestedReduction:
         if broadcast_relations is None:
             return None
 
+        access_relations = (
+            *source_relations,
+            *broadcast_relations,
+            *internal_relations,
+        )
+        if not cls._sub_parent_relations_are_replay_compatible(access_relations):
+            return None
+
         return SubParentEpilogueStage(
             factor=sub_parent_factor,
-            access_relations=(
-                *source_relations,
-                *broadcast_relations,
-                *internal_relations,
-            ),
+            access_relations=access_relations,
             output_groups=output_groups,
         )
+
+    @staticmethod
+    def _sub_parent_relations_are_replay_compatible(
+        relations: Sequence[SubParentAccessRelation],
+    ) -> bool:
+        """Reject source-name contracts the replay resolver cannot represent."""
+        relations_by_name: dict[str, list[SubParentAccessRelation]] = (
+            collections.defaultdict(list)
+        )
+        for relation in relations:
+            relations_by_name[relation.consumer_access.name].append(relation)
+
+        for name_relations in relations_by_name.values():
+            if not all(
+                isinstance(relation, SubParentAccessRelation)
+                for relation in name_relations
+            ):
+                continue
+            translated = [
+                relation
+                for relation in name_relations
+                if relation.translation is not None
+            ]
+            if translated and len(translated) != len(name_relations):
+                return False
+            if not translated:
+                continue
+            source_sets = OrderedSet(
+                frozenset(relation.source_accesses) for relation in translated
+            )
+            # ``requires_live_source`` is relation-specific: the same source
+            # name may be forwarded for one output and remain an external or
+            # graph-output access for another.  The codegen descriptor retains
+            # that distinction, so differing roles are not a reason to reject
+            # an otherwise compatible translated group.
+            if len(source_sets) != 1:
+                return False
+        return True
 
     @classmethod
     def _min_block_unprofitable_for_kernel(
