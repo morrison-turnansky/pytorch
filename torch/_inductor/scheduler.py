@@ -6700,6 +6700,7 @@ class Scheduler:
             self.nodes = self.maybe_reorder_for_minimizing_partition(self.nodes)
             self.nodes = self.reorder_for_partition_with_simple_dependency(self.nodes)
 
+        self.validate_staged_reductions()
         self.compute_last_usage()
 
         if torch._inductor.config.test_configs.track_memory_lifecycle:
@@ -13217,6 +13218,10 @@ class BaseScheduling:  # noqa: docstring_linter
         """Whether this backend can represent an approved staged plan."""
         del plan
         return False
+
+    def validate_staged_reduction(self, node: FusedStagedReduction) -> None:
+        """Validate a committed staged node after scheduler transformations."""
+        del node
 
     def can_fuse_vertical(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode

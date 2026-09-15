@@ -3164,6 +3164,22 @@ class SIMDScheduling(BaseScheduling):
     def has_sub_parent_epilogue(self, nodes: Sequence[BaseSchedulerNode]) -> bool:
         return self._find_sub_parent_epilogue_plan(list(nodes)) is not None
 
+    def validate_staged_reduction(
+        self, node: scheduler.FusedStagedReduction
+    ) -> None:
+        """Reconstruct a committed standalone staged plan from final nodes."""
+        if not self._is_standalone_staged_reduction(node):
+            return
+        nodes = [
+            sn
+            for sn in node.get_nodes()
+            if not self.scheduler or sn.get_name() not in self.scheduler.removed_ops
+        ]
+        if self._find_sub_parent_epilogue_plan(nodes) is None:
+            raise AssertionError(
+                "committed sub-parent reduction plan was lost after scheduling"
+            )
+
     def _find_sub_parent_epilogue_plan(
         self,
         nodes: Sequence[BaseSchedulerNode],
