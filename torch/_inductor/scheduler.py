@@ -6622,6 +6622,7 @@ class Scheduler:
             self.nodes = self.maybe_reorder_for_minimizing_partition(self.nodes)
             self.nodes = self.reorder_for_partition_with_simple_dependency(self.nodes)
 
+        self.validate_staged_reductions()
         self.compute_last_usage()
 
         if torch._inductor.config.test_configs.track_memory_lifecycle:
@@ -11729,6 +11730,16 @@ class Scheduler:
             node.set_last_usage(future_used_buffers, self.mutation_real_name)
             future_used_buffers.update(node.last_usage)
 
+    def validate_staged_reductions(self) -> None:
+        """Reconstruct committed staged plans after scheduler transformations."""
+        for node in self.nodes:
+            if not isinstance(node, FusedStagedReduction):
+                continue
+            device = node.get_device()
+            if device is None:
+                raise AssertionError("staged reduction must have a device")
+            self.get_backend(device).validate_staged_reduction(node)
+
     def free_buffers(self) -> None:
         """Free any buffers that are no longer needed"""
         for name in sorted(
@@ -13113,6 +13124,10 @@ class BaseScheduling:  # noqa: docstring_linter
         compile. Declining costs a combo or a benchmark, not the fusion.
         """
         return False
+
+    def validate_staged_reduction(self, node: FusedStagedReduction) -> None:
+        """Validate a committed staged node after scheduler transformations."""
+        del node
 
     def can_fuse_vertical(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
