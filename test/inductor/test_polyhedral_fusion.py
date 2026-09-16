@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 import torch._inductor.config as inductor_config
 from torch._inductor import metrics
 from torch._inductor.choices import InductorChoices
@@ -26,6 +27,7 @@ from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 
 HEAD_DIM = 192
 QK_ROPE_A = 64
+HIDDEN_SIZE = 7168
 
 
 def _shifted_mla_indexer(x, ln_w, ln_b, cos, sin, rope_width):
@@ -42,6 +44,15 @@ def _shifted_mla_indexer(x, ln_w, ln_b, cos, sin, rope_width):
 
 def shifted_mla_indexer(x, ln_w, ln_b, cos, sin):
     return _shifted_mla_indexer(x, ln_w, ln_b, cos, sin, QK_ROPE_A)
+
+
+def shifted_mla_indexer_256(x, ln_w, ln_b, cos, sin):
+    return _shifted_mla_indexer(x, ln_w, ln_b, cos, sin, QK_ROPE_A)
+
+
+def flinear_shifted_mla_indexer(hidden_states, wk_weight, ln_w, ln_b, cos, sin):
+    projected = F.linear(hidden_states, wk_weight)
+    return shifted_mla_indexer(projected, ln_w, ln_b, cos, sin)
 
 
 def shifted_mla_external_consumer(x, ln_w, ln_b, cos, sin):
@@ -71,6 +82,29 @@ def _make_mla_inputs(
         torch.randn(batch_size, seq_len, head_dim, device=GPU_TYPE, dtype=dtype),
         torch.randn(head_dim, device=GPU_TYPE, dtype=dtype),
         torch.randn(head_dim, device=GPU_TYPE, dtype=dtype),
+        torch.randn(
+            batch_size, seq_len, 1, QK_ROPE_A, device=GPU_TYPE, dtype=dtype
+        ),
+        torch.randn(
+            batch_size, seq_len, 1, QK_ROPE_A, device=GPU_TYPE, dtype=dtype
+        ),
+    )
+
+
+def _make_flinear_inputs(*, batch_size: int, seq_len: int):
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    return (
+        torch.randn(
+            batch_size,
+            seq_len,
+            HIDDEN_SIZE,
+            device=GPU_TYPE,
+            dtype=dtype,
+        ),
+        torch.randn(HEAD_DIM, HIDDEN_SIZE, device=GPU_TYPE, dtype=dtype),
+        torch.randn(HEAD_DIM, device=GPU_TYPE, dtype=dtype),
+        torch.randn(HEAD_DIM, device=GPU_TYPE, dtype=dtype),
         torch.randn(
             batch_size, seq_len, 1, QK_ROPE_A, device=GPU_TYPE, dtype=dtype
         ),
@@ -198,6 +232,62 @@ def _observe(
     )
 
 
+def _mark_dynamic_batch_sequence(inputs: tuple[torch.Tensor, ...]) -> None:
+    for tensor in inputs:
+        for dim in range(tensor.dim()):
+            if dim >= 2 or tensor.dim() < 2:
+                torch._dynamo.mark_static(tensor, dim)
+            else:
+                torch._dynamo.mark_dynamic(tensor, dim)
+
+
+def _observe_dynamic(
+    fn,
+    inputs_by_shape: tuple[tuple[torch.Tensor, ...], ...],
+    *,
+    polyhedral_fusion: bool,
+):
+    torch._dynamo.reset()
+    metrics.reset()
+    staged_plans = []
+
+    def capture(nodes):
+        _capture_staged_plans(nodes, staged_plans)
+        return nodes
+
+    _mark_dynamic_batch_sequence(inputs_by_shape[0])
+    outputs = []
+    with (
+        inductor_config.patch(
+            polyhedral_fusion=polyhedral_fusion,
+            _post_fusion_custom_pass=capture,
+            fx_graph_cache=False,
+        ),
+        inductor_config.patch("triton.nested_reduction", True),
+        fresh_inductor_cache(),
+    ):
+        compiled = torch.compile(fn, fullgraph=True, dynamic=True)
+        for inputs in inputs_by_shape:
+            result = compiled(*inputs)
+            if not isinstance(result, tuple):
+                raise AssertionError("dynamic MLA fixture must return a tuple")
+            outputs.append(tuple(result))
+
+    translations = tuple(
+        relation.translation
+        for plan in staged_plans
+        for stage in plan.sub_parent_stages
+        for relation in stage.access_relations
+    )
+    return outputs, _Observation(
+        outputs=tuple(outputs[-1]),
+        generated_kernel_count=metrics.generated_kernel_count,
+        translated_codegen_count=metrics.codegen_translated_staged_reduction,
+        staged_fusion_count=len(staged_plans),
+        translations=translations,
+    )
+
+
 def _assert_outputs_match(expected, actual) -> None:
     if len(expected) != len(actual):
         raise AssertionError(f"expected {len(expected)} outputs, got {len(actual)}")
@@ -216,7 +306,7 @@ class PolyhedralMLAFusionTest(TestCase):
         self.assertEqual(set(observation.translations), {(0, 0), (0, QK_ROPE_A)})
 
     def test_static_shape_matrix(self):
-        for batch_size, seq_len in ((2, 8),):
+        for batch_size, seq_len in ((2, 8), (4, 512), (64, 1)):
             inputs = _make_mla_inputs(batch_size=batch_size, seq_len=seq_len)
             eager = tuple(shifted_mla_indexer(*inputs))
             disabled = _observe(
@@ -234,6 +324,70 @@ class PolyhedralMLAFusionTest(TestCase):
             self.assertEqual(disabled.translated_codegen_count, 0)
             self.assertEqual(disabled.staged_fusion_count, 0)
             self.assert_translated_plan(enabled)
+
+    def test_dynamic_batch_and_sequence(self):
+        inputs_by_shape = tuple(
+            _make_mla_inputs(batch_size=batch_size, seq_len=seq_len)
+            for batch_size, seq_len in ((2, 8), (4, 5), (64, 1))
+        )
+        eager = [tuple(shifted_mla_indexer(*inputs)) for inputs in inputs_by_shape]
+        disabled_outputs, disabled = _observe_dynamic(
+            shifted_mla_indexer,
+            inputs_by_shape,
+            polyhedral_fusion=False,
+        )
+        enabled_outputs, enabled = _observe_dynamic(
+            shifted_mla_indexer,
+            inputs_by_shape,
+            polyhedral_fusion=True,
+        )
+        for expected, disabled_result, enabled_result in zip(
+            eager, disabled_outputs, enabled_outputs
+        ):
+            _assert_outputs_match(expected, disabled_result)
+            _assert_outputs_match(expected, enabled_result)
+        self.assertEqual(disabled.translated_codegen_count, 0)
+        self.assert_translated_plan(enabled)
+
+    def test_second_contiguous_topology(self):
+        inputs = _make_mla_inputs(batch_size=2, seq_len=8, head_dim=256)
+        eager = tuple(shifted_mla_indexer_256(*inputs))
+        disabled = _observe(
+            shifted_mla_indexer_256,
+            inputs,
+            polyhedral_fusion=False,
+        )
+        enabled = _observe(
+            shifted_mla_indexer_256,
+            inputs,
+            polyhedral_fusion=True,
+        )
+        _assert_outputs_match(eager, disabled.outputs)
+        _assert_outputs_match(eager, enabled.outputs)
+        self.assertEqual(disabled.translated_codegen_count, 0)
+        self.assert_translated_plan(enabled)
+
+    def test_flinear_boundary(self):
+        inputs = _make_flinear_inputs(batch_size=2, seq_len=8)
+        eager = tuple(flinear_shifted_mla_indexer(*inputs))
+        disabled = _observe(
+            flinear_shifted_mla_indexer,
+            inputs,
+            polyhedral_fusion=False,
+        )
+        enabled = _observe(
+            flinear_shifted_mla_indexer,
+            inputs,
+            polyhedral_fusion=True,
+        )
+        _assert_outputs_match(eager, disabled.outputs)
+        _assert_outputs_match(eager, enabled.outputs)
+        self.assertEqual(disabled.translated_codegen_count, 0)
+        self.assert_translated_plan(enabled)
+        self.assertLessEqual(
+            enabled.generated_kernel_count,
+            disabled.generated_kernel_count,
+        )
 
     def test_looped_declines_and_persistent_fuses(self):
         inputs = _make_mla_inputs(batch_size=2, seq_len=8)
