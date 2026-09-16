@@ -845,6 +845,8 @@ class NestedReduction:
         # A fraction of the parent tile, with the grouped axis split into lanes.
         SUB_PARENT = enum.auto()
 
+    SUB_PARENT_RATES = ((2, 1), (4, 1), (4, 3))
+
     class GroupedAxis(enum.Enum):
         R = enum.auto()
         X = enum.auto()
@@ -1279,6 +1281,14 @@ class NestedReduction:
         A 128-element output from a 192-element parent has rate ``(3, 2)``.
         """
         if V.graph.sizevars.statically_known_equals(node_numel, 0):
+            return None
+        if not config.polyhedral_fusion:
+            for rate in cls.SUB_PARENT_RATES:
+                factor, output_lanes = rate
+                if V.graph.sizevars.statically_known_equals(
+                    factor * node_numel, output_lanes * full_numel
+                ):
+                    return rate
             return None
         ratio = sympy.cancel(sympy.sympify(full_numel) / sympy.sympify(node_numel))
         factor_expr, output_lanes_expr = sympy.fraction(ratio)
