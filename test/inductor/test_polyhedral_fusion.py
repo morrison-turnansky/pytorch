@@ -143,6 +143,7 @@ class _Observation:
     translations: tuple[tuple[object, ...], ...]
     logical_factors: tuple[int, ...]
     r0_blocks: tuple[int, ...] = ()
+    parent_widths: tuple[int, ...] = ()
     lifetime_signatures: tuple[tuple[str, int, int, int], ...] = ()
 
 
@@ -254,6 +255,7 @@ def _observe(
         for plan in staged_plans
         for stage in plan.sub_parent_stages
     )
+    parent_widths = tuple(int(plan.parent_rnumel) for plan in staged_plans)
     r0_blocks = tuple(
         int(match)
         for source_code in source_codes
@@ -267,17 +269,30 @@ def _observe(
         translations=translations,
         logical_factors=logical_factors,
         r0_blocks=r0_blocks,
+        parent_widths=parent_widths,
         lifetime_signatures=tuple(lifetime_signatures),
     )
 
 
-def _mark_dynamic_batch_sequence(inputs: tuple[torch.Tensor, ...]) -> None:
-    for tensor in inputs:
+def _mark_dynamic_batch_sequence(
+    inputs: tuple[torch.Tensor, ...], *, dynamic_feature_width: bool = False
+) -> None:
+    for input_index, tensor in enumerate(inputs):
         for dim in range(tensor.dim()):
-            if dim >= 2 or tensor.dim() < 2:
-                torch._dynamo.mark_static(tensor, dim)
-            else:
+            is_feature_width = dynamic_feature_width and (
+                (input_index == 0 and dim == 2)
+                or (input_index in (1, 2) and dim == 0)
+            )
+            if is_feature_width:
+                # The translated path may intentionally specialize this
+                # dimension through SizeVarAllocator.guard_int.  A weak
+                # dynamic mark keeps it symbolic during tracing without
+                # rejecting that guarded specialization.
+                torch._dynamo.maybe_mark_dynamic(tensor, dim)
+            elif tensor.dim() >= 2 and dim < 2:
                 torch._dynamo.mark_dynamic(tensor, dim)
+            else:
+                torch._dynamo.mark_static(tensor, dim)
 
 
 def _observe_dynamic(
@@ -285,6 +300,8 @@ def _observe_dynamic(
     inputs_by_shape: tuple[tuple[torch.Tensor, ...], ...],
     *,
     polyhedral_fusion: bool,
+    dynamic_feature_width: bool = False,
+    capture_source: bool = False,
 ):
     torch._dynamo.reset()
     metrics.reset()
@@ -294,8 +311,11 @@ def _observe_dynamic(
         _capture_staged_plans(nodes, staged_plans)
         return nodes
 
-    _mark_dynamic_batch_sequence(inputs_by_shape[0])
+    _mark_dynamic_batch_sequence(
+        inputs_by_shape[0], dynamic_feature_width=dynamic_feature_width
+    )
     outputs = []
+    source_codes = []
     with (
         inductor_config.patch(
             polyhedral_fusion=polyhedral_fusion,
@@ -307,7 +327,11 @@ def _observe_dynamic(
     ):
         compiled = torch.compile(fn, fullgraph=True, dynamic=True)
         for inputs in inputs_by_shape:
-            result = compiled(*inputs)
+            if capture_source:
+                result, sources = run_and_get_code(compiled, *inputs)
+                source_codes.extend(sources)
+            else:
+                result = compiled(*inputs)
             if not isinstance(result, tuple):
                 raise AssertionError("dynamic MLA fixture must return a tuple")
             outputs.append(tuple(result))
@@ -323,6 +347,12 @@ def _observe_dynamic(
         for plan in staged_plans
         for stage in plan.sub_parent_stages
     )
+    parent_widths = tuple(int(plan.parent_rnumel) for plan in staged_plans)
+    r0_blocks = tuple(
+        int(match)
+        for source_code in source_codes
+        for match in re.findall(r"R0_BLOCK: tl\.constexpr = (\d+)", source_code)
+    )
     return outputs, _Observation(
         outputs=tuple(outputs[-1]),
         generated_kernel_count=metrics.generated_kernel_count,
@@ -330,6 +360,8 @@ def _observe_dynamic(
         staged_fusion_count=len(staged_plans),
         translations=translations,
         logical_factors=logical_factors,
+        r0_blocks=r0_blocks,
+        parent_widths=parent_widths,
     )
 
 
@@ -428,6 +460,51 @@ class PolyhedralMLAFusionTest(TestCase):
             _assert_outputs_match(expected, enabled_result)
         self.assertEqual(disabled.translated_codegen_count, 0)
         self.assert_translated_plan(enabled)
+
+    def test_dynamic_feature_width_specializes_translated_plan(self):
+        inputs_by_shape = tuple(
+            _make_mla_inputs(
+                batch_size=batch_size,
+                seq_len=seq_len,
+                head_dim=head_dim,
+            )
+            for batch_size, seq_len, head_dim in (
+                (2, 8, 192),
+                (2, 8, 256),
+                (2, 8, 384),
+                (4, 5, 192),
+                (64, 1, 256),
+            )
+        )
+        eager = [tuple(shifted_mla_indexer(*inputs)) for inputs in inputs_by_shape]
+        disabled_outputs, disabled = _observe_dynamic(
+            shifted_mla_indexer,
+            inputs_by_shape,
+            polyhedral_fusion=False,
+            dynamic_feature_width=True,
+        )
+        enabled_outputs, enabled = _observe_dynamic(
+            shifted_mla_indexer,
+            inputs_by_shape,
+            polyhedral_fusion=True,
+            dynamic_feature_width=True,
+            capture_source=True,
+        )
+        for expected, disabled_result, enabled_result in zip(
+            eager, disabled_outputs, enabled_outputs
+        ):
+            _assert_outputs_match(expected, disabled_result)
+            _assert_outputs_match(expected, enabled_result)
+
+        self.assertEqual(disabled.translated_codegen_count, 0)
+        self.assertEqual(disabled.staged_fusion_count, 0)
+        self.assert_translated_plan(enabled)
+        self.assertEqual(
+            set(zip(enabled.parent_widths, enabled.logical_factors)),
+            {(192, 3), (256, 4), (384, 6)},
+        )
+        self.assertIn(256, enabled.r0_blocks)
+        self.assertIn(512, enabled.r0_blocks)
 
     def test_second_contiguous_topology(self):
         inputs = _make_mla_inputs(batch_size=2, seq_len=8, head_dim=256)
