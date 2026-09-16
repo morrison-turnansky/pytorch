@@ -948,6 +948,53 @@ class NestedReduction:
         )
 
     @classmethod
+    def _specialize_translated_parent_width(
+        cls,
+        nodes: Sequence[SchedulerNode],
+        parent_numel: sympy.Expr,
+        parent_rnumel: sympy.Expr,
+    ) -> tuple[sympy.Expr, dict[sympy.Expr, sympy.Expr]]:
+        """Specialize a translated sub-parent's canonical parent width.
+
+        A translated sub-parent relation needs the concrete parent reduction
+        width before its rate and physical projection geometry can be derived.
+        Keep this specialization behind the opt-in polyhedral path and only
+        request it when a sub-parent-shaped node has a width-dependent rate.
+        The returned substitution is applied to dependency extents as well as
+        the scheduler's domain arithmetic; installing the guard alone would
+        leave expressions such as ``R - 64`` symbolic.
+        """
+        parent_rnumel = V.graph.sizevars.simplify(parent_rnumel)
+        if not config.polyhedral_fusion:
+            return parent_rnumel, {}
+
+        full_numel = V.graph.sizevars.simplify(parent_numel * parent_rnumel)
+        for node in nodes:
+            if node.is_reduction():
+                continue
+            _, (node_numel, node_rnumel) = node.group
+            node_numel = V.graph.sizevars.simplify(node_numel)
+            node_rnumel = V.graph.sizevars.simplify(node_rnumel)
+            if not V.graph.sizevars.statically_known_equals(node_rnumel, 1):
+                continue
+            if V.graph.sizevars.statically_known_equals(node_numel, parent_numel):
+                continue
+            if V.graph.sizevars.statically_known_equals(node_numel, full_numel):
+                continue
+            if cls._sub_parent_epilogue_rate(node_numel, full_numel) is None:
+                # This is intentionally a guard, not an optimization hint. The
+                # concrete result is used to rebuild every width-dependent plan
+                # field before the candidate can commit fusion.
+                parent_width = V.graph.sizevars.guard_int(parent_rnumel)
+                specialized_parent_rnumel = sympy.Integer(parent_width)
+                if parent_rnumel == specialized_parent_rnumel:
+                    return specialized_parent_rnumel, {}
+                return specialized_parent_rnumel, {
+                    parent_rnumel: specialized_parent_rnumel
+                }
+        return parent_rnumel, {}
+
+    @classmethod
     def sub_parent_epilogue_plan(
         cls,
         nodes: Sequence[BaseSchedulerNode],
@@ -966,6 +1013,14 @@ class NestedReduction:
         if not all(isinstance(node, SchedulerNode) for node in nodes):
             return None
         scheduler_nodes = typing.cast("Sequence[SchedulerNode]", nodes)
+        parent_rnumel, width_subs = cls._specialize_translated_parent_width(
+            scheduler_nodes,
+            numel,
+            parent_rnumel,
+        )
+        planning_rnumel = (
+            parent_rnumel if config.polyhedral_fusion else rnumel
+        )
 
         # TODO: Consider an alternative to rediscovering the reduction here.
         reduction_nodes = tuple(node for node in scheduler_nodes if node.is_reduction())
@@ -976,7 +1031,8 @@ class NestedReduction:
         grouping = cls._sub_parent_epilogue_candidate_nodes(
             scheduler_nodes,
             numel,
-            rnumel,
+            planning_rnumel,
+            extent_subs=width_subs or None,
         )
         if grouping is None:
             return None
@@ -998,7 +1054,7 @@ class NestedReduction:
             )
             & epilogue_read_names
         )
-        full_numel = V.graph.sizevars.simplify(numel * rnumel)
+        full_numel = V.graph.sizevars.simplify(numel * planning_rnumel)
         parent_write_names = OrderedSet(
             dep.name
             for node in parent_nodes
@@ -1018,6 +1074,14 @@ class NestedReduction:
         internal_relations = cls._sub_parent_internal_access_relations(output_groups)
         if internal_relations is None:
             return None
+        known_extent_subs = dict(width_subs)
+        if config.polyhedral_fusion:
+            rate_extent_subs = cls.try_get_sub_parent_extent_subs(
+                parent_rnumel, sub_parent_factor
+            )
+            if rate_extent_subs is None:
+                return None
+            known_extent_subs.update(rate_extent_subs)
         source_relations = cls._try_get_sub_parent_access_relations(
             parent_nodes,
             epilogue_nodes,
@@ -1025,14 +1089,11 @@ class NestedReduction:
             parent_rnumel,
             parent_source_names,
             sub_parent_factor,
+            known_extent_subs=known_extent_subs or None,
         )
         output_relations = ()
         if config.polyhedral_fusion:
-            extent_subs = cls.try_get_sub_parent_extent_subs(
-                parent_rnumel, sub_parent_factor
-            )
-            if extent_subs is None:
-                return None
+            extent_subs = known_extent_subs
             output_relations = cls._sub_parent_output_access_relations(
                 parent_nodes,
                 numel,
@@ -1058,7 +1119,7 @@ class NestedReduction:
             parent_nodes,
             planned_source_names & parent_write_names,
             numel,
-            rnumel,
+            planning_rnumel,
         )
         if ordered_parent_nodes is None:
             return None
@@ -1186,16 +1247,30 @@ class NestedReduction:
         nodes: Sequence[SchedulerNode],
         numel: sympy.Expr,
         rnumel: sympy.Expr,
+        *,
+        extent_subs: dict[sympy.Expr, sympy.Expr] | None = None,
     ) -> SubParentEpilogueGrouping | None:
         """Group lane-resolution consumers and choose their lane factor.
 
         Other members must fit the parent reduction, reduced-output, or
         full-parent domain.
         """
-        full_numel = V.graph.sizevars.simplify(numel * rnumel)
+        if extent_subs:
+            full_numel = V.graph.sizevars.simplify(
+                sympy_subs(numel * rnumel, extent_subs)
+            )
+        else:
+            full_numel = V.graph.sizevars.simplify(numel * rnumel)
         candidates: list[SubParentEpilogueCandidate] = []
         for node in nodes:
             _, (node_numel, node_rnumel) = node.group
+            if extent_subs:
+                node_numel = V.graph.sizevars.simplify(
+                    sympy_subs(node_numel, extent_subs)
+                )
+                node_rnumel = V.graph.sizevars.simplify(
+                    sympy_subs(node_rnumel, extent_subs)
+                )
             if node.is_reduction():
                 if not (
                     V.graph.sizevars.statically_known_equals(node_numel, numel)
@@ -1205,9 +1280,19 @@ class NestedReduction:
                 continue
             # REDUCED takes precedence when rnumel == factor and its shape is
             # indistinguishable from SUB_PARENT; decline the ambiguous latter.
-            if cls._pointwise_node_matches_domain(node, numel, (numel,)):
+            if cls._pointwise_node_matches_domain(
+                node,
+                numel,
+                (numel,),
+                extent_subs=extent_subs,
+            ):
                 continue
-            if cls._pointwise_node_matches_domain(node, full_numel, (numel, rnumel)):
+            if cls._pointwise_node_matches_domain(
+                node,
+                full_numel,
+                (numel, rnumel),
+                extent_subs=extent_subs,
+            ):
                 continue
             rate = cls._sub_parent_epilogue_rate(
                 node_numel,
@@ -1220,7 +1305,10 @@ class NestedReduction:
                     FloorDiv(rnumel, node_factor) * output_lanes,
                 )
                 if cls._pointwise_node_matches_domain(
-                    node, sympy_product(expected_groups), expected_groups
+                    node,
+                    sympy_product(expected_groups),
+                    expected_groups,
+                    extent_subs=extent_subs,
                 ):
                     candidates.append(
                         SubParentEpilogueCandidate(
@@ -1347,10 +1435,15 @@ class NestedReduction:
         node: SchedulerNode,
         expected_numel: sympy.Expr,
         expected_groups: Sequence[sympy.Expr],
+        *,
+        extent_subs: dict[sympy.Expr, sympy.Expr] | None = None,
     ) -> bool:
         from .codegen.simd import SIMDKernel
 
         _, (node_numel, node_rnumel) = node.group
+        if extent_subs:
+            node_numel = sympy_subs(node_numel, extent_subs)
+            node_rnumel = sympy_subs(node_rnumel, extent_subs)
         return (
             V.graph.sizevars.statically_known_equals(node_rnumel, 1)
             and V.graph.sizevars.statically_known_equals(node_numel, expected_numel)
