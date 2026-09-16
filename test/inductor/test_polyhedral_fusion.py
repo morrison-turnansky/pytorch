@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 from contextlib import nullcontext
 from unittest.mock import patch
 
@@ -20,7 +21,7 @@ from torch._inductor.scheduler import (
     Scheduler,
 )
 from torch._inductor.test_case import TestCase, run_tests
-from torch._inductor.utils import fresh_inductor_cache
+from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
 from torch._inductor.virtualized import V
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 
@@ -121,6 +122,8 @@ class _Observation:
     translated_codegen_count: int
     staged_fusion_count: int
     translations: tuple[tuple[object, ...], ...]
+    logical_factors: tuple[int, ...]
+    r0_blocks: tuple[int, ...] = ()
     lifetime_signatures: tuple[tuple[str, int, int, int], ...] = ()
 
 
@@ -169,6 +172,7 @@ def _observe(
     reorder_for_peak_memory: bool | None = None,
     memory_planning: bool | None = None,
     memory_pool: str | None = None,
+    capture_source: bool = False,
 ) -> _Observation:
     torch._dynamo.reset()
     metrics.reset()
@@ -212,7 +216,11 @@ def _observe(
         patch.object(Scheduler, "compute_last_usage", capture_last_usage),
     ):
         compiled = torch.compile(fn, fullgraph=True)
-        outputs = compiled(*inputs)
+        if capture_source:
+            outputs, source_codes = run_and_get_code(compiled, *inputs)
+        else:
+            outputs = compiled(*inputs)
+            source_codes = ()
 
     if not isinstance(outputs, tuple):
         raise AssertionError("translated MLA fixture must return a tuple")
@@ -222,12 +230,24 @@ def _observe(
         for stage in plan.sub_parent_stages
         for relation in stage.access_relations
     )
+    logical_factors = tuple(
+        stage.factor
+        for plan in staged_plans
+        for stage in plan.sub_parent_stages
+    )
+    r0_blocks = tuple(
+        int(match)
+        for source_code in source_codes
+        for match in re.findall(r"R0_BLOCK: tl\.constexpr = (\d+)", source_code)
+    )
     return _Observation(
         outputs=tuple(outputs),
         generated_kernel_count=metrics.generated_kernel_count,
         translated_codegen_count=metrics.codegen_translated_staged_reduction,
         staged_fusion_count=len(staged_plans),
         translations=translations,
+        logical_factors=logical_factors,
+        r0_blocks=r0_blocks,
         lifetime_signatures=tuple(lifetime_signatures),
     )
 
@@ -279,12 +299,18 @@ def _observe_dynamic(
         for stage in plan.sub_parent_stages
         for relation in stage.access_relations
     )
+    logical_factors = tuple(
+        stage.factor
+        for plan in staged_plans
+        for stage in plan.sub_parent_stages
+    )
     return outputs, _Observation(
         outputs=tuple(outputs[-1]),
         generated_kernel_count=metrics.generated_kernel_count,
         translated_codegen_count=metrics.codegen_translated_staged_reduction,
         staged_fusion_count=len(staged_plans),
         translations=translations,
+        logical_factors=logical_factors,
     )
 
 
@@ -324,6 +350,41 @@ class PolyhedralMLAFusionTest(TestCase):
             self.assertEqual(disabled.translated_codegen_count, 0)
             self.assertEqual(disabled.staged_fusion_count, 0)
             self.assert_translated_plan(enabled)
+
+    def test_looped_and_persistent_translated_fusion(self):
+        inputs = _make_mla_inputs(batch_size=2, seq_len=8)
+        eager = tuple(shifted_mla_indexer(*inputs))
+        for force_persistent in (False, True):
+            disabled = _observe(
+                shifted_mla_indexer,
+                inputs,
+                polyhedral_fusion=False,
+                force_persistent=force_persistent,
+            )
+            enabled = _observe(
+                shifted_mla_indexer,
+                inputs,
+                polyhedral_fusion=True,
+                force_persistent=force_persistent,
+            )
+            _assert_outputs_match(eager, disabled.outputs)
+            _assert_outputs_match(eager, enabled.outputs)
+            self.assertEqual(disabled.translated_codegen_count, 0)
+            self.assert_translated_plan(enabled)
+
+    def test_nested_reduction_gate(self):
+        inputs = _make_mla_inputs(batch_size=2, seq_len=8)
+        eager = tuple(shifted_mla_indexer(*inputs))
+        observation = _observe(
+            shifted_mla_indexer,
+            inputs,
+            polyhedral_fusion=True,
+            nested_reduction=False,
+        )
+        _assert_outputs_match(eager, observation.outputs)
+        self.assertEqual(observation.translated_codegen_count, 0)
+        self.assertEqual(observation.staged_fusion_count, 0)
+        self.assertEqual(observation.translations, ())
 
     def test_dynamic_batch_and_sequence(self):
         inputs_by_shape = tuple(
@@ -367,6 +428,30 @@ class PolyhedralMLAFusionTest(TestCase):
         self.assertEqual(disabled.translated_codegen_count, 0)
         self.assert_translated_plan(enabled)
 
+    def test_wider_logical_factor_uses_nontrivial_r0_block(self):
+        inputs = _make_mla_inputs(batch_size=2, seq_len=8, head_dim=384)
+        eager = tuple(shifted_mla_indexer(*inputs))
+        disabled = _observe(
+            shifted_mla_indexer,
+            inputs,
+            polyhedral_fusion=False,
+            force_persistent=True,
+        )
+        enabled = _observe(
+            shifted_mla_indexer,
+            inputs,
+            polyhedral_fusion=True,
+            force_persistent=True,
+            capture_source=True,
+        )
+        _assert_outputs_match(eager, disabled.outputs)
+        _assert_outputs_match(eager, enabled.outputs)
+        self.assertEqual(disabled.translated_codegen_count, 0)
+        self.assert_translated_plan(enabled)
+        self.assertEqual(set(enabled.logical_factors), {6})
+        self.assertIn(512, enabled.r0_blocks)
+        self.assertTrue(all(block > 0 for block in enabled.r0_blocks))
+
     def test_flinear_boundary(self):
         inputs = _make_flinear_inputs(batch_size=2, seq_len=8)
         eager = tuple(flinear_shifted_mla_indexer(*inputs))
@@ -388,46 +473,6 @@ class PolyhedralMLAFusionTest(TestCase):
             enabled.generated_kernel_count,
             disabled.generated_kernel_count,
         )
-
-    def test_looped_declines_and_persistent_fuses(self):
-        inputs = _make_mla_inputs(batch_size=2, seq_len=8)
-        eager = tuple(shifted_mla_indexer(*inputs))
-        for force_persistent in (False, True):
-            disabled = _observe(
-                shifted_mla_indexer,
-                inputs,
-                polyhedral_fusion=False,
-                force_persistent=force_persistent,
-            )
-            enabled = _observe(
-                shifted_mla_indexer,
-                inputs,
-                polyhedral_fusion=True,
-                force_persistent=force_persistent,
-            )
-            _assert_outputs_match(eager, disabled.outputs)
-            _assert_outputs_match(eager, enabled.outputs)
-            self.assertEqual(disabled.translated_codegen_count, 0)
-            if force_persistent:
-                self.assert_translated_plan(enabled)
-            else:
-                self.assertEqual(enabled.translated_codegen_count, 0)
-                self.assertEqual(enabled.staged_fusion_count, 0)
-                self.assertEqual(enabled.translations, ())
-
-    def test_nested_reduction_gate(self):
-        inputs = _make_mla_inputs(batch_size=2, seq_len=8)
-        eager = tuple(shifted_mla_indexer(*inputs))
-        observation = _observe(
-            shifted_mla_indexer,
-            inputs,
-            polyhedral_fusion=True,
-            nested_reduction=False,
-        )
-        _assert_outputs_match(eager, observation.outputs)
-        self.assertEqual(observation.translated_codegen_count, 0)
-        self.assertEqual(observation.staged_fusion_count, 0)
-        self.assertEqual(observation.translations, ())
 
     def test_translated_lifetime_survives_external_consumer(self):
         inputs = _make_mla_inputs(batch_size=2, seq_len=8)
