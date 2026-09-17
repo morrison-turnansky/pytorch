@@ -66,6 +66,25 @@ def shifted_mla_mutating_indexer(x, ln_w, ln_b, cos, sin, output):
     return k_rot, k_pass, output
 
 
+def strided_shifted_mla_indexer(x, ln_w, ln_b, cos, sin):
+    mean = x.mean(-1, keepdim=True)
+    var = ((x - mean) ** 2).mean(-1, keepdim=True)
+    normed = (x - mean) / torch.sqrt(var + 1e-5) * ln_w + ln_b
+    strided = normed[..., ::2].unsqueeze(2)
+    leading = strided[..., :32]
+    return leading * cos[..., :32] + leading * sin[..., :32], strided[..., 32:]
+
+
+def indirect_shifted_mla_indexer(x, ln_w, ln_b, cos, sin):
+    mean = x.mean(-1, keepdim=True)
+    var = ((x - mean) ** 2).mean(-1, keepdim=True)
+    normed = (x - mean) / torch.sqrt(var + 1e-5) * ln_w + ln_b
+    indices = torch.arange(96, device=x.device) * 2
+    gathered = normed.index_select(-1, indices).unsqueeze(2)
+    leading = gathered[..., :32]
+    return leading * cos[..., :32] + leading * sin[..., :32], gathered[..., 32:]
+
+
 def equal_split_mla_indexer(x, ln_w, ln_b):
     mean = x.mean(-1, keepdim=True)
     var = ((x - mean) ** 2).mean(-1, keepdim=True)
@@ -636,6 +655,20 @@ class PolyhedralMLAFusionTest(TestCase):
                 self.assertGreater(inner_nodes, 1)
                 self.assertGreater(outputs, 0)
                 self.assertGreater(last_usage, 0)
+
+    def test_translated_fallback_rejects_non_affine_layouts(self):
+        inputs = _make_mla_inputs(batch_size=2, seq_len=8)
+        for fn in (strided_shifted_mla_indexer, indirect_shifted_mla_indexer):
+            with self.subTest(fn=fn.__name__):
+                eager = tuple(fn(*inputs))
+                observation = _observe(
+                    fn,
+                    inputs,
+                    polyhedral_fusion=True,
+                )
+                _assert_outputs_match(eager, observation.outputs)
+                self.assertEqual(observation.translated_codegen_count, 0)
+                self.assertNotIn((0, QK_ROPE_A), observation.translations)
 
     def test_legal_but_unsupported_split_declines(self):
         inputs = _make_mla_inputs(batch_size=2, seq_len=8)[:3]
