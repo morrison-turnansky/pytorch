@@ -6484,6 +6484,11 @@ class Scheduler:
         self.nodes = [self.create_scheduler_node(n) for n in nodes]
         self.previous_node: BaseSchedulerNode | None = None
         self.current_node: BaseSchedulerNode | None = None
+
+        # Unlike V.graph.removed_buffers, the op recorded here is removed but
+        # we still need the buffer (generated in alternative ways).
+        self.removed_ops: OrderedSet[str] = OrderedSet()
+
         self.update_zero_dim_cpu_tensor()
         # some new constants could have been created above
         self.available_buffer_names.update(V.graph.constants.keys())
@@ -6728,10 +6733,6 @@ class Scheduler:
                 "num_nodes_after_fusion": len(self.nodes),
             }
         )
-
-        # Unlike V.graph.removed_buffers, the op recorded here is removed but
-        # we still need the buffer (generated in alternative ways)
-        self.removed_ops: OrderedSet[str] = OrderedSet()
 
     def get_donated_buffers(self) -> dict[str, SchedulerDonatedBuffer]:
         name_to_donated_buf = {}
