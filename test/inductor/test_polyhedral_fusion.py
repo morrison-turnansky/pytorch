@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 from contextlib import nullcontext
+from unittest.mock import patch
 
 import torch
 import torch._inductor.config as inductor_config
@@ -15,6 +16,7 @@ from torch._inductor.scheduler import (
     FusedNestedReductions,
     FusedStagedReduction,
     NestedReduction,
+    Scheduler,
 )
 from torch._inductor.test_case import TestCase, run_tests
 from torch._inductor.utils import fresh_inductor_cache
@@ -40,6 +42,17 @@ def _shifted_mla_indexer(x, ln_w, ln_b, cos, sin, rope_width):
 
 def shifted_mla_indexer(x, ln_w, ln_b, cos, sin):
     return _shifted_mla_indexer(x, ln_w, ln_b, cos, sin, QK_ROPE_A)
+
+
+def shifted_mla_external_consumer(x, ln_w, ln_b, cos, sin):
+    k_rot, k_pass = shifted_mla_indexer(x, ln_w, ln_b, cos, sin)
+    return k_rot, k_pass, k_pass.sin()
+
+
+def shifted_mla_mutating_indexer(x, ln_w, ln_b, cos, sin, output):
+    k_rot, k_pass = shifted_mla_indexer(x, ln_w, ln_b, cos, sin)
+    output.copy_(k_pass)
+    return k_rot, k_pass, output
 
 
 def equal_split_mla_indexer(x, ln_w, ln_b):
@@ -74,6 +87,7 @@ class _Observation:
     translated_codegen_count: int
     staged_fusion_count: int
     translations: tuple[tuple[object, ...], ...]
+    lifetime_signatures: tuple[tuple[str, int, int, int], ...] = ()
 
 
 def _capture_staged_plans(nodes, staged_plans):
@@ -118,24 +132,50 @@ def _observe(
     polyhedral_fusion: bool,
     force_persistent: bool | None = None,
     nested_reduction: bool = True,
+    reorder_for_peak_memory: bool | None = None,
+    memory_planning: bool | None = None,
+    memory_pool: str | None = None,
 ) -> _Observation:
     torch._dynamo.reset()
     metrics.reset()
     staged_plans = []
+    lifetime_signatures = []
+    original_compute_last_usage = Scheduler.compute_last_usage
 
     def capture(nodes):
         _capture_staged_plans(nodes, staged_plans)
         return nodes
 
+    def capture_last_usage(scheduler):
+        original_compute_last_usage(scheduler)
+        lifetime_signatures.extend(
+            (
+                type(node).__name__,
+                len(node.get_nodes()),
+                len(node.get_outputs()),
+                len(node.last_usage),
+            )
+            for node in scheduler.nodes
+        )
+
+    compile_config = {
+        "polyhedral_fusion": polyhedral_fusion,
+        "_post_fusion_custom_pass": capture,
+        "fx_graph_cache": False,
+    }
+    if reorder_for_peak_memory is not None:
+        compile_config["reorder_for_peak_memory"] = reorder_for_peak_memory
+    if memory_planning is not None:
+        compile_config["memory_planning"] = memory_planning
+    if memory_pool is not None:
+        compile_config["memory_pool"] = memory_pool
+
     with (
-        inductor_config.patch(
-            polyhedral_fusion=polyhedral_fusion,
-            _post_fusion_custom_pass=capture,
-            fx_graph_cache=False,
-        ),
+        inductor_config.patch(compile_config),
         inductor_config.patch("triton.nested_reduction", nested_reduction),
         fresh_inductor_cache(),
         _choices_context(force_persistent),
+        patch.object(Scheduler, "compute_last_usage", capture_last_usage),
     ):
         compiled = torch.compile(fn, fullgraph=True)
         outputs = compiled(*inputs)
@@ -154,6 +194,7 @@ def _observe(
         translated_codegen_count=metrics.codegen_translated_staged_reduction,
         staged_fusion_count=len(staged_plans),
         translations=translations,
+        lifetime_signatures=tuple(lifetime_signatures),
     )
 
 
@@ -233,6 +274,101 @@ class PolyhedralMLAFusionTest(TestCase):
         self.assertEqual(observation.translated_codegen_count, 0)
         self.assertEqual(observation.staged_fusion_count, 0)
         self.assertEqual(observation.translations, ())
+
+    def test_translated_lifetime_survives_external_consumer(self):
+        inputs = _make_mla_inputs(batch_size=2, seq_len=8)
+        eager = tuple(shifted_mla_external_consumer(*inputs))
+        observation = _observe(
+            shifted_mla_external_consumer,
+            inputs,
+            polyhedral_fusion=True,
+        )
+        _assert_outputs_match(eager, observation.outputs)
+        self.assert_translated_plan(observation)
+        self.assertEqual(
+            sum(
+                signature[0] == "FusedStagedReduction"
+                for signature in observation.lifetime_signatures
+            ),
+            observation.staged_fusion_count,
+        )
+        self.assertTrue(
+            any(
+                signature[0] == "SchedulerNode"
+                for signature in observation.lifetime_signatures
+            )
+        )
+
+    def test_translated_lifetime_survives_mutation(self):
+        inputs = _make_mla_inputs(batch_size=2, seq_len=8)
+        eager_output = torch.empty(
+            2, 8, 1, 128, device=GPU_TYPE, dtype=torch.bfloat16
+        )
+        eager = tuple(
+            shifted_mla_mutating_indexer(
+                *inputs,
+                eager_output,
+            )
+        )
+
+        disabled_output = torch.empty_like(eager_output)
+        disabled = _observe(
+            shifted_mla_mutating_indexer,
+            (*inputs, disabled_output),
+            polyhedral_fusion=False,
+        )
+        enabled_output = torch.empty_like(eager_output)
+        enabled = _observe(
+            shifted_mla_mutating_indexer,
+            (*inputs, enabled_output),
+            polyhedral_fusion=True,
+        )
+        _assert_outputs_match(eager, disabled.outputs)
+        _assert_outputs_match(eager, enabled.outputs)
+        self.assertEqual(disabled.translated_codegen_count, 0)
+        self.assert_translated_plan(enabled)
+        self.assertTrue(
+            all(
+                inner_nodes > 1 and outputs > 0 and last_usage > 0
+                for kind, inner_nodes, outputs, last_usage in enabled.lifetime_signatures
+                if kind == "FusedStagedReduction"
+            )
+        )
+
+    def test_translated_lifetime_with_peak_reordering_and_memory_pools(self):
+        inputs = _make_mla_inputs(batch_size=2, seq_len=8)
+        eager = tuple(shifted_mla_indexer(*inputs))
+        for reorder, memory_planning, memory_pool in (
+            (False, False, "none"),
+            (True, False, "none"),
+            (False, True, "intermediates"),
+            (True, True, "intermediates"),
+        ):
+            with self.subTest(
+                reorder=reorder,
+                memory_planning=memory_planning,
+                memory_pool=memory_pool,
+            ):
+                observation = _observe(
+                    shifted_mla_indexer,
+                    inputs,
+                    polyhedral_fusion=True,
+                    reorder_for_peak_memory=reorder,
+                    memory_planning=memory_planning,
+                    memory_pool=memory_pool,
+                )
+                _assert_outputs_match(eager, observation.outputs)
+                self.assert_translated_plan(observation)
+                staged_lifetimes = [
+                    signature
+                    for signature in observation.lifetime_signatures
+                    if signature[0] == "FusedStagedReduction"
+                ]
+                self.assertEqual(len(staged_lifetimes), 1)
+                _, inner_nodes, outputs, last_usage = staged_lifetimes[0]
+                self.assertGreater(inner_nodes, 1)
+                self.assertGreater(outputs, 0)
+                self.assertGreater(last_usage, 0)
 
     def test_legal_but_unsupported_split_declines(self):
         inputs = _make_mla_inputs(batch_size=2, seq_len=8)[:3]
