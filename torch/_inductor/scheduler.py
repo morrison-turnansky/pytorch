@@ -3205,17 +3205,6 @@ class StagedReductionPlan:
                 stage.factor,
                 tuple(
                     (
-                        relation.consumer_access.name,
-                        tuple(source.name for source in relation.source_accesses),
-                        relation.mapping_kind,
-                        relation.parent_lane,
-                        relation.requires_live_source,
-                        relation.translation,
-                    )
-                    for relation in stage.access_relations
-                ),
-                tuple(
-                    (
                         group.output_lanes,
                         tuple(node_id(node) for node in group.nodes),
                     )
@@ -5280,7 +5269,10 @@ class FusedStagedReduction(FusedSchedulerNode):
             self.staged_plan_signature is not None
             and signature != self.staged_plan_signature
         ):
-            raise AssertionError("committed staged reduction identity changed")
+            raise AssertionError(
+                "committed staged reduction identity changed: "
+                f"{self.staged_plan_signature!r} != {signature!r}"
+            )
         self.staged_plan_signature = signature
         self.staged_plan = plan
 
@@ -7951,10 +7943,13 @@ class Scheduler:
         nested = NestedReduction._is_dependent_reduction_pair(
             node1, node2
         ) and NestedReduction.can_fuse(node1, node2)
+        standalone = NestedReduction._is_enabled_for(
+            node1, node2
+        ) and NestedReduction.find_sub_parent_epilogue_plan(fused_nodes) is not None
         if (
             staged
             or nested
-            or NestedReduction.find_sub_parent_epilogue_plan(fused_nodes) is not None
+            or standalone
         ):
             return FusionResult.fuse(True)
 
@@ -13356,9 +13351,11 @@ class BaseScheduling:  # noqa: docstring_linter
             staged = isinstance(node1, FusedStagedReduction) or isinstance(
                 node2, FusedStagedReduction
             )
-            plan = NestedReduction.find_sub_parent_epilogue_plan(nodes)
-            if node1.get_device() is None:
-                plan = None
+            plan = (
+                None
+                if node1.get_device() is None
+                else NestedReduction.find_sub_parent_epilogue_plan(nodes)
+            )
             staged = staged or plan is not None
             node_type = FusedStagedReduction if staged else FusedSchedulerNode
             fused = node_type.fuse(node1, node2)
