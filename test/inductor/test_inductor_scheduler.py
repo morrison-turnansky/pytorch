@@ -16,6 +16,7 @@ from torch._inductor.codegen.common import CSEVariable
 from torch._inductor.codegen.simd import (
     _GroupedReductionLayout,
     _PointwiseRemapHandler,
+    _SubParentFusion,
     _SubParentValueResolver,
     _TranslatedProjectionGeometry,
     SIMDScheduling,
@@ -43,6 +44,7 @@ from torch._inductor.scheduler import (
     SubParentEpilogueCandidate,
     SubParentEpilogueGrouping,
     SubParentEpilogueStage,
+    SubParentFusionResult,
     SubParentOutputGroup,
     StagedReductionPlan,
 )
@@ -123,7 +125,7 @@ def _test_cases(device, dtype):
 
 
 class TestScheduler(TestCase):
-    def test_combined_scheduling_delegates_staged_backend_gate(self):
+    def test_combined_scheduling_delegates_sub_parent_query(self):
         from torch._inductor.codegen.cuda_combined_scheduling import (
             CUDACombinedScheduling,
         )
@@ -131,17 +133,18 @@ class TestScheduler(TestCase):
             XPUCombinedScheduling,
         )
 
-        plan = Mock()
+        nodes = (Mock(),)
+        result = Mock()
         for scheduling_cls in (CUDACombinedScheduling, XPUCombinedScheduling):
             with self.subTest(scheduling_cls=scheduling_cls.__name__):
                 scheduling = scheduling_cls.__new__(scheduling_cls)
                 triton_scheduling = Mock()
                 scheduling._triton_scheduling = triton_scheduling
 
-                scheduling.can_fuse_staged_reduction(plan)
+                scheduling.has_sub_parent_epilogue(nodes, result)
 
-                triton_scheduling.can_fuse_staged_reduction.assert_called_once_with(
-                    plan
+                triton_scheduling.has_sub_parent_epilogue.assert_called_once_with(
+                    nodes, result
                 )
 
     def test_scheduler_rebuilds_final_staged_plan(self):
@@ -741,7 +744,7 @@ class TestScheduler(TestCase):
                 translated_projection=geometry,
             )
 
-    def test_staged_backend_gate_does_not_replan_or_check_physical_geometry(self):
+    def test_sub_parent_decision_reuses_result_and_preserves_tristate(self):
         row, feature = sympy.symbols(
             "capability_row capability_feature", integer=True, nonnegative=True
         )
@@ -753,6 +756,7 @@ class TestScheduler(TestCase):
         )
 
         def make_plan(child_width, factor, translation):
+            epilogue = Mock()
             consumer = MemoryDep(
                 "buf0",
                 192 * row + feature + translation,
@@ -774,21 +778,39 @@ class TestScheduler(TestCase):
                 factor=factor,
                 access_relations=(relation,),
                 output_groups=(
-                    SubParentOutputGroup(output_lanes=1, nodes=(Mock(),)),
+                    SubParentOutputGroup(output_lanes=1, nodes=(epilogue,)),
                 ),
             )
-            return StagedReductionPlan(
-                parent_nodes=(),
-                parent_numel=sympy.Integer(4),
-                parent_rnumel=sympy.Integer(192),
-                nested_stage=None,
-                sub_parent_stages=(stage,),
+            return (
+                StagedReductionPlan(
+                    parent_nodes=(),
+                    parent_numel=sympy.Integer(4),
+                    parent_rnumel=sympy.Integer(192),
+                    nested_stage=None,
+                    sub_parent_stages=(stage,),
+                ),
+                epilogue,
             )
 
-        supported_plan = make_plan(64, 3, 0)
-        non_power_of_two_child_plan = make_plan(96, 2, 0)
+        supported_plan, epilogue = make_plan(64, 3, 0)
+        non_power_of_two_child_plan, non_power_epilogue = make_plan(96, 2, 0)
         scheduling = object.__new__(SIMDScheduling)
         scheduling.supports_sub_parent_epilogue = True
+        scheduler = object.__new__(Scheduler)
+        scheduler._active_sub_parent_fusion = None
+        scheduling.scheduler = scheduler
+
+        reduction = Mock()
+        reduction.is_reduction.return_value = True
+        reduction.group = (None, (sympy.Integer(4), sympy.Integer(192)))
+        reduction.get_nodes.return_value = [reduction]
+
+        def consumer_for(node):
+            consumer_node = Mock()
+            consumer_node.is_reduction.return_value = False
+            consumer_node.group = (None, (sympy.Integer(256), sympy.Integer(1)))
+            consumer_node.get_nodes.return_value = [node]
+            return consumer_node
 
         with (
             patch.object(
@@ -796,14 +818,44 @@ class TestScheduler(TestCase):
             ),
             patch.object(
                 NestedReduction,
-                "sub_parent_epilogue_plan",
+                "sub_parent_epilogue_result",
                 side_effect=AssertionError("backend gate must not replan"),
             ),
             inductor_config.patch({"triton.nested_reduction": True}),
         ):
-            self.assertTrue(scheduling.can_fuse_staged_reduction(supported_plan))
-            self.assertTrue(
-                scheduling.can_fuse_staged_reduction(non_power_of_two_child_plan)
+            consumer = consumer_for(epilogue)
+            with scheduler._use_sub_parent_fusion_result(
+                reduction,
+                consumer,
+                SubParentFusionResult(True, supported_plan),
+            ):
+                self.assertIs(
+                    scheduling._sub_parent_epilogue_decision(reduction, consumer),
+                    _SubParentFusion.FUSE,
+                )
+            self.assertIs(
+                scheduling._sub_parent_epilogue_decision(
+                    reduction,
+                    consumer_for(non_power_epilogue),
+                    SubParentFusionResult(True, non_power_of_two_child_plan),
+                ),
+                _SubParentFusion.FUSE,
+            )
+            self.assertIs(
+                scheduling._sub_parent_epilogue_decision(
+                    reduction,
+                    consumer_for(epilogue),
+                    SubParentFusionResult(True, None, "proof failed"),
+                ),
+                _SubParentFusion.REJECT,
+            )
+            self.assertIs(
+                scheduling._sub_parent_epilogue_decision(
+                    reduction,
+                    consumer_for(epilogue),
+                    SubParentFusionResult(False, None),
+                ),
+                _SubParentFusion.DEFER,
             )
 
     def test_sub_parent_resolver_uses_planned_lane_set(self):
