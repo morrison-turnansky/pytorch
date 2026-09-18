@@ -33,6 +33,7 @@ from torch._inductor.scheduler import (
     ExternKernelSchedulerNode,
     ForeachKernelSchedulerNode,
     FusedNestedReductions,
+    FusedStagedReduction,
     MemoryDepMatch,
     NestedReduction,
     OrderedParentNodes,
@@ -122,7 +123,7 @@ def _test_cases(device, dtype):
 
 
 class TestScheduler(TestCase):
-    def test_combined_scheduling_delegates_staged_validation(self):
+    def test_combined_scheduling_delegates_staged_backend_gate(self):
         from torch._inductor.codegen.cuda_combined_scheduling import (
             CUDACombinedScheduling,
         )
@@ -130,18 +131,68 @@ class TestScheduler(TestCase):
             XPUCombinedScheduling,
         )
 
-        node = Mock()
+        plan = Mock()
         for scheduling_cls in (CUDACombinedScheduling, XPUCombinedScheduling):
             with self.subTest(scheduling_cls=scheduling_cls.__name__):
                 scheduling = scheduling_cls.__new__(scheduling_cls)
                 triton_scheduling = Mock()
                 scheduling._triton_scheduling = triton_scheduling
 
-                scheduling.validate_staged_reduction(node)
+                scheduling.can_fuse_staged_reduction(plan)
 
-                triton_scheduling.validate_staged_reduction.assert_called_once_with(
-                    node
+                triton_scheduling.can_fuse_staged_reduction.assert_called_once_with(
+                    plan
                 )
+
+    def test_scheduler_rebuilds_final_staged_plan(self):
+        initial_plan = Mock()
+        final_plan = Mock()
+        initial_plan.semantic_signature.return_value = ("staged",)
+        final_plan.semantic_signature.return_value = ("staged",)
+        leaf = Mock()
+        leaf.get_name.return_value = "leaf"
+        node = object.__new__(FusedStagedReduction)
+        node.snodes = [leaf]
+        node.staged_plan = initial_plan
+        node.staged_plan_signature = ("staged",)
+        scheduling = object.__new__(Scheduler)
+        scheduling.nodes = [node]
+        scheduling.removed_ops = OrderedSet()
+
+        with patch.object(
+            NestedReduction,
+            "find_sub_parent_epilogue_plan",
+            return_value=final_plan,
+        ) as rebuild:
+            scheduling.validate_staged_reductions()
+
+        self.assertIs(node.staged_plan, final_plan)
+        rebuild.assert_called_once_with([leaf])
+
+    def test_scheduler_rejects_changed_staged_identity(self):
+        final_plan = Mock()
+        final_plan.semantic_signature.return_value = ("changed",)
+        leaf = Mock()
+        leaf.get_name.return_value = "leaf"
+        node = object.__new__(FusedStagedReduction)
+        node.snodes = [leaf]
+        node.staged_plan = Mock()
+        node.staged_plan_signature = ("committed",)
+        scheduling = object.__new__(Scheduler)
+        scheduling.nodes = [node]
+        scheduling.removed_ops = OrderedSet()
+
+        with (
+            patch.object(
+                NestedReduction,
+                "find_sub_parent_epilogue_plan",
+                return_value=final_plan,
+            ),
+            self.assertRaisesRegex(
+                AssertionError, "committed staged reduction identity changed"
+            ),
+        ):
+            scheduling.validate_staged_reductions()
 
     def test_identity_translation_proof_matrix(self):
         """Keep the Phase 1 proof and rejection matrix in the in-tree suite."""
@@ -690,7 +741,7 @@ class TestScheduler(TestCase):
                 translated_projection=geometry,
             )
 
-    def test_translated_capability_gate_declines_unsupported_geometry(self):
+    def test_staged_backend_gate_does_not_replan_or_check_physical_geometry(self):
         row, feature = sympy.symbols(
             "capability_row capability_feature", integer=True, nonnegative=True
         )
@@ -735,28 +786,24 @@ class TestScheduler(TestCase):
             )
 
         supported_plan = make_plan(64, 3, 0)
-        unsupported_plan = make_plan(96, 2, 0)
+        non_power_of_two_child_plan = make_plan(96, 2, 0)
         scheduling = object.__new__(SIMDScheduling)
         scheduling.supports_sub_parent_epilogue = True
-        graph = Mock(sizevars=SizeVarAllocator())
 
         with (
-            V.set_graph_handler(graph),
             patch.object(
                 SIMDScheduling, "_sub_parent_tiling_is_2d", return_value=True
             ),
             patch.object(
                 NestedReduction,
                 "sub_parent_epilogue_plan",
-                side_effect=(supported_plan, unsupported_plan),
+                side_effect=AssertionError("backend gate must not replan"),
             ),
             inductor_config.patch({"triton.nested_reduction": True}),
         ):
-            self.assertIs(
-                scheduling._sub_parent_epilogue_plan([], 4, 192), supported_plan
-            )
-            self.assertIsNone(
-                scheduling._sub_parent_epilogue_plan([], 4, 192)
+            self.assertTrue(scheduling.can_fuse_staged_reduction(supported_plan))
+            self.assertTrue(
+                scheduling.can_fuse_staged_reduction(non_power_of_two_child_plan)
             )
 
     def test_sub_parent_resolver_uses_planned_lane_set(self):

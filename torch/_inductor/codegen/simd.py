@@ -1578,12 +1578,6 @@ class _LaneProjection:
     split: bool
 
 
-class _SubParentFusion(enum.Enum):
-    DEFER = enum.auto()
-    REJECT = enum.auto()
-    FUSE = enum.auto()
-
-
 def _select_lane(
     parts: tuple[CSEVariable, ...],
     lane: sympy.Expr,
@@ -3222,17 +3216,6 @@ class SIMDScheduling(BaseScheduling):
                 reduction_can_fuse = MixOrderReduction.can_fuse(node1, node2)
 
             if not reduction_can_fuse:
-                # Scheduler legality creates the fused nested node, but SIMD
-                # still runs this backend fusion gate. The regular
-                # numel/rnumel checks reject nested reductions because the two
-                # reductions intentionally use different iteration spaces.
-                from torch._inductor.scheduler import NestedReduction
-
-                reduction_can_fuse = NestedReduction._is_dependent_reduction_pair(
-                    node1, node2
-                ) and NestedReduction.can_fuse(node1, node2)
-
-            if not reduction_can_fuse:
                 why(
                     "numel/rnumel mismatch (reduce) (%s, %s), (%s, %s)",
                     numel1,
@@ -3266,16 +3249,6 @@ class SIMDScheduling(BaseScheduling):
                     for n2 in node2.get_nodes()
                 ):
                     why("invalid loop order and tiling for native matmul")
-                    return False
-
-            if reduction_can_fuse and any(
-                isinstance(node, scheduler.FusedStagedReduction)
-                and not isinstance(node, scheduler.FusedNestedReductions)
-                for node in (node1, node2)
-            ):
-                nodes = [*node1.get_nodes(), *node2.get_nodes()]
-                if self._find_sub_parent_epilogue_plan(nodes) is None:
-                    why("staged reduction plan would be lost")
                     return False
 
             return reduction_can_fuse
@@ -3377,16 +3350,6 @@ class SIMDScheduling(BaseScheduling):
             if ordinary_fusion and not self._is_standalone_staged_reduction(node2):
                 return True
 
-            if (
-                node2.get_operation_names() & node1.ancestors
-                or self._is_standalone_staged_reduction(node2)
-            ):
-                sub_parent_fusion = self._sub_parent_epilogue_decision(node1, node2)
-                if sub_parent_fusion is _SubParentFusion.REJECT:
-                    why("invalid sub-parent epilogue fusion")
-                    return False
-                if sub_parent_fusion is _SubParentFusion.FUSE:
-                    return True
             if self._is_standalone_staged_reduction(node2):
                 why("staged reduction plan would be lost")
                 return False
@@ -3402,112 +3365,24 @@ class SIMDScheduling(BaseScheduling):
     can_fuse_vertical = can_fuse
     can_fuse_horizontal = can_fuse
 
-    @staticmethod
-    def _is_sub_parent_shaped(
-        node: scheduler.BaseSchedulerNode,
-        parent_numel: sympy.Expr,
-        parent_rnumel: sympy.Expr,
+    def can_fuse_staged_reduction(
+        self, plan: scheduler.StagedReductionPlan
     ) -> bool:
-        """Whether ``node`` runs at a fraction of the parent tile.
-
-        A group member is normally reduced ``(parent_numel, 1)``, full resolution
-        ``(parent_numel * parent_rnumel, 1)``, or the reduction itself. Anything
-        else only has meaning under a sub-parent plan.
-        """
-        if node.is_reduction():
-            return False
-        _, (node_numel, node_rnumel) = node.group
-        if not V.graph.sizevars.statically_known_equals(node_rnumel, 1):
-            return False
-        return not (
-            V.graph.sizevars.statically_known_equals(node_numel, parent_numel)
-            or V.graph.sizevars.statically_known_equals(
-                node_numel, parent_numel * parent_rnumel
-            )
-        )
-
-    def _sub_parent_epilogue_decision(
-        self,
-        node1: scheduler.BaseSchedulerNode,
-        node2: scheduler.BaseSchedulerNode,
-    ) -> _SubParentFusion:
-        """Decide whether sub-parent planning fuses, rejects, or defers."""
+        """Check only SIMD representation of a scheduler-approved plan."""
         if (
             not self.supports_sub_parent_epilogue
             or not torch._inductor.config.triton.nested_reduction
         ):
-            return _SubParentFusion.DEFER
-        if node1.is_reduction() == node2.is_reduction():
-            return _SubParentFusion.DEFER
-        reduction_node = node1 if node1.is_reduction() else node2
-        consumer_node = node2 if node1.is_reduction() else node1
-        _, (parent_numel, parent_rnumel) = reduction_node.group
-        nodes = [*reduction_node.get_nodes(), *consumer_node.get_nodes()]
-        plan = self._sub_parent_epilogue_plan(nodes, parent_numel, parent_rnumel)
-        if plan is None:
-            # No sub-parent plan covers the combined set, so a sub-parent-shaped
-            # member would reach generic tiling and scheduling, neither of which
-            # models a fraction of the parent tile. Keep it out of the group.
-            # The nested append path owns its own sub-parent stage, so leave
-            # those pairs to FusedNestedReductions.can_fuse_with.
-            if isinstance(node1, scheduler.FusedNestedReductions) or isinstance(
-                node2, scheduler.FusedNestedReductions
-            ):
-                return _SubParentFusion.DEFER
-            return (
-                _SubParentFusion.REJECT
-                if any(
-                    self._is_sub_parent_shaped(node, parent_numel, parent_rnumel)
-                    for node in nodes
-                )
-                else _SubParentFusion.DEFER
-            )
-        stage = plan.sub_parent_stages[0]
-        epilogue_nodes = stage.epilogue_nodes
-        epilogue_node_set = OrderedSet(epilogue_nodes)
-        if self._is_standalone_staged_reduction(reduction_node):
-            return _SubParentFusion.FUSE
-        return (
-            _SubParentFusion.FUSE
-            if all(node in epilogue_node_set for node in consumer_node.get_nodes())
-            else _SubParentFusion.DEFER
+            return False
+        if plan.nested_stage is not None:
+            return True
+        nodes = [
+            *plan.parent_nodes,
+            *(node for stage in plan.sub_parent_stages for node in stage.epilogue_nodes),
+        ]
+        return self._sub_parent_tiling_is_2d(
+            nodes, plan.parent_numel, plan.parent_rnumel
         )
-
-    def _sub_parent_epilogue_plan(
-        self,
-        nodes: Sequence[BaseSchedulerNode],
-        parent_numel: sympy.Expr,
-        parent_rnumel: sympy.Expr,
-    ) -> scheduler.StagedReductionPlan | None:
-        """The scheduler's plan, gated on this backend being able to emit it.
-
-        The backend gates (config, ``supports_sub_parent_epilogue``, 2D tiling)
-        belong here rather than in the scheduler, which has no view of them. See
-        Note [Sub-parent reduction epilogues].
-        """
-        if (
-            not self.supports_sub_parent_epilogue
-            or not torch._inductor.config.triton.nested_reduction
-        ):
-            return None
-        plan = scheduler.NestedReduction.sub_parent_epilogue_plan(
-            nodes, parent_numel, parent_rnumel
-        )
-        if plan is None:
-            return None
-        if not self._sub_parent_tiling_is_2d(nodes, parent_numel, parent_rnumel):
-            return None
-        if any(
-            relation.translation is not None
-            for stage in plan.sub_parent_stages
-            for relation in stage.access_relations
-        ) and self._translated_projection_geometry(plan) is None:
-            # The scheduler proof establishes semantic legality, but the first
-            # Triton slice supports only a narrower physical projection.  Keep
-            # this decline before a staged identity is committed; codegen still
-            # revalidates the committed plan and treats a mismatch as an ICE.
-            return None
-        return plan
 
     @staticmethod
     def _translated_projection_geometry(
@@ -3620,37 +3495,6 @@ class SIMDScheduling(BaseScheduling):
             reduction_nodes, parent_numel, parent_rnumel, None
         )
         return len(tiling) == 2
-
-    def has_sub_parent_epilogue(self, nodes: Sequence[BaseSchedulerNode]) -> bool:
-        return self._find_sub_parent_epilogue_plan(list(nodes)) is not None
-
-    def validate_staged_reduction(self, node: scheduler.FusedStagedReduction) -> None:
-        """Reconstruct a committed standalone staged plan from final nodes."""
-        if not self._is_standalone_staged_reduction(node):
-            return
-        nodes = [
-            sn
-            for sn in node.get_nodes()
-            if not self.scheduler or sn.get_name() not in self.scheduler.removed_ops
-        ]
-        if self._find_sub_parent_epilogue_plan(nodes) is None:
-            raise AssertionError(
-                "committed sub-parent reduction plan was lost after scheduling"
-            )
-
-    def _find_sub_parent_epilogue_plan(
-        self,
-        nodes: Sequence[BaseSchedulerNode],
-    ) -> scheduler.StagedReductionPlan | None:
-        """Return the first valid standalone sub-parent plan for ``nodes``."""
-        for node in nodes:
-            if not node.is_reduction():
-                continue
-            _, (parent_numel, parent_rnumel) = node.group
-            plan = self._sub_parent_epilogue_plan(nodes, parent_numel, parent_rnumel)
-            if plan is not None:
-                return plan
-        return None
 
     def generate_node_schedule(
         self,
@@ -4090,15 +3934,11 @@ class SIMDScheduling(BaseScheduling):
     def codegen_staged_reduction(self, node):
         """See Note [Sub-parent reduction epilogues]."""
         # TODO: Share the parent-kernel pipeline and specialize only stage emission.
+        plan = node.staged_plan
+        if plan is None:
+            raise AssertionError("staged reduction semantic plan was lost before codegen")
         if isinstance(node, scheduler.FusedNestedReductions):
-            plan = scheduler.NestedReduction.plan_from_topology(
-                node.node1,
-                node.node2,
-                node.grouped_reduction,
-                node.group_size,
-                node.grouped_axis,
-            )
-            if plan is None or plan.nested_stage is None:
+            if plan.nested_stage is None:
                 raise AssertionError("nested reduction plan was lost before codegen")
             return self._codegen_nested_reduction(node, plan)
 
@@ -4109,9 +3949,6 @@ class SIMDScheduling(BaseScheduling):
             for sn in node.get_nodes()
             if not self.scheduler or sn.get_name() not in self.scheduler.removed_ops
         ]
-        plan = self._find_sub_parent_epilogue_plan(nodes)
-        if plan is None:
-            raise AssertionError("sub-parent reduction plan was lost before codegen")
         return self._codegen_reduction_with_sub_parent_epilogue(nodes, plan)
 
     def _codegen_nested_reduction(self, node, plan):
