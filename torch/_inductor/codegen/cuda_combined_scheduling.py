@@ -11,7 +11,6 @@ from ..scheduler import (
     BaseSchedulerNode,
     BaseScheduling,
     FusedSchedulerNode,
-    FusedStagedReduction,
     Scheduler,
     SchedulerNode,
     SubParentFusionResult,

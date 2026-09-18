@@ -767,9 +767,9 @@ class MixOrderReduction:
 # Fusion-time planning proves that a derived sub-parent domain is safe to emit
 # and gives the fused group a FusedStagedReduction identity. Standalone staged
 # groups may be rewritten by merge_loops(), while nested groups preserve the loop
-# bodies used to approve their topology. Codegen rebuilds the final plan from the
-# final fused nodes in either case. The staged identity is the stable contract:
-# codegen cannot decline the fusion and treats a missing final plan as a compiler
+# bodies used to approve their topology. The committed plan is passed to
+# backend validation and codegen. The staged identity is the stable contract:
+# codegen cannot decline the fusion and treats a missing plan as a compiler
 # error.
 class NestedReduction:
     """
@@ -3223,6 +3223,49 @@ class StagedReductionPlan:
                 for source in relation.source_accesses:
                     yield source, relation.consumer_access
 
+    def semantic_signature(self) -> tuple[Any, ...]:
+        """Return the stable staged identity retained across loop rewrites."""
+
+        def node_id(node: BaseSchedulerNode) -> tuple[str, ...]:
+            return tuple(sorted(node.get_operation_names()))
+
+        nested = self.nested_stage
+        nested_signature = (
+            None
+            if nested is None
+            else (
+                nested.group_size,
+                nested.grouped_axis,
+                tuple(node_id(node) for node in nested.grouped_nodes),
+                node_id(nested.domain_context.grouped_reduction),
+                tuple(
+                    (node_id(node), domain)
+                    for node, domain in nested.pointwise_domains
+                ),
+            )
+        )
+        sub_parent_signatures = tuple(
+            (
+                stage.factor,
+                tuple(
+                    (
+                        group.output_lanes,
+                        tuple(node_id(node) for node in group.nodes),
+                    )
+                    for group in stage.output_groups
+                ),
+            )
+            for stage in self.sub_parent_stages
+        )
+        parent_reductions = tuple(
+            sorted(
+                node_id(node)
+                for node in self.parent_nodes
+                if node.is_reduction()
+            )
+        )
+        return parent_reductions, nested_signature, sub_parent_signatures
+
 
 @dataclasses.dataclass
 class SchedulerBuffer:
@@ -5261,6 +5304,21 @@ class FusedMixOrderReductions(FusedSchedulerNode):
 
 class FusedStagedReduction(FusedSchedulerNode):
     """Common identity for fused reduction groups needing staged codegen."""
+    staged_plan: StagedReductionPlan | None = None
+    staged_plan_signature: tuple[Any, ...] | None = None
+
+    def set_staged_plan(self, plan: StagedReductionPlan) -> None:
+        signature = plan.semantic_signature()
+        if (
+            self.staged_plan_signature is not None
+            and signature != self.staged_plan_signature
+        ):
+            raise AssertionError(
+                "committed staged reduction identity changed: "
+                f"{self.staged_plan_signature!r} != {signature!r}"
+            )
+        self.staged_plan_signature = signature
+        self.staged_plan = plan
 
 
 class FusedNestedReductions(FusedStagedReduction):
@@ -5275,12 +5333,14 @@ class FusedNestedReductions(FusedStagedReduction):
         node1: BaseSchedulerNode,
         node2: BaseSchedulerNode,
         stage: NestedReductionStage,
+        plan: StagedReductionPlan,
     ) -> None:
         self.node1 = node1
         self.node2 = node2
         super().__init__(
             node1.scheduler, list(node1.get_nodes()) + list(node2.get_nodes())
         )
+        self.set_staged_plan(plan)
         # Nested append fusion checks legality against node2, the grouped
         # stage, while the fused node owns producers from both stages. Hide
         # internal producer-consumer edges from later ancestor checks so reads
@@ -5368,7 +5428,9 @@ class FusedNestedReductions(FusedStagedReduction):
         )
         if plan.nested_stage is None:
             raise AssertionError("expected nested reduction stage")
-        return FusedNestedReductions(self.node1, grouped_node, plan.nested_stage)
+        return FusedNestedReductions(
+            self.node1, grouped_node, plan.nested_stage, plan
+        )
 
 
 class FusedExternTritonKernelSchedulerNode(FusedSchedulerNode):
@@ -11878,6 +11940,34 @@ class Scheduler:
             node.set_last_usage(future_used_buffers, self.mutation_real_name)
             future_used_buffers.update(node.last_usage)
 
+    def validate_staged_reductions(self) -> None:
+        """Rebuild committed staged plans once from final scheduler nodes."""
+        for node in self.nodes:
+            if not isinstance(node, FusedStagedReduction):
+                continue
+            if node.staged_plan_signature is None:
+                raise AssertionError("staged reduction semantic identity was lost")
+            if isinstance(node, FusedNestedReductions):
+                plan = NestedReduction.plan_from_topology(
+                    node.node1,
+                    node.node2,
+                    node.grouped_reduction,
+                    node.group_size,
+                    node.grouped_axis,
+                )
+            else:
+                nodes = [
+                    sn
+                    for sn in node.get_nodes()
+                    if sn.get_name() not in self.removed_ops
+                ]
+                plan = NestedReduction.find_sub_parent_epilogue_plan(nodes)
+            if plan is None:
+                raise AssertionError(
+                    "committed staged reduction plan was lost after scheduling"
+                )
+            node.set_staged_plan(plan)
+
     def free_buffers(self) -> None:
         """Free any buffers that are no longer needed"""
         for name in sorted(
@@ -13252,20 +13342,14 @@ class BaseScheduling:  # noqa: docstring_linter
         """Return a set of .codegen.common.BackendFeature()"""
         return OrderedSet()
 
-    def has_sub_parent_epilogue(self, nodes: Sequence[BaseSchedulerNode]) -> bool:
-        """Whether ``nodes`` codegen through the sub-parent staged emitter.
-
-        Combo kernels and fusion benchmarking re-expand a group through generic
-        scheduling, which cannot represent the epilogue's derived group and
-        raises ``unexpected group``. Backends that emit sub-parent epilogues
-        report them here so those paths decline the node instead of aborting the
-        compile. Declining costs a combo or a benchmark, not the fusion.
-        """
+    def has_sub_parent_epilogue(
+        self,
+        nodes: Sequence[BaseSchedulerNode],
+        fusion_result: SubParentFusionResult | None = None,
+    ) -> bool:
+        """Whether ``nodes`` codegen through the sub-parent staged emitter."""
+        del nodes, fusion_result
         return False
-
-    def validate_staged_reduction(self, node: FusedStagedReduction) -> None:
-        """Validate a committed staged node after scheduler transformations."""
-        del node
 
     def can_fuse_vertical(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
@@ -13333,7 +13417,7 @@ class BaseScheduling:  # noqa: docstring_linter
         ):
             if plan.nested_stage is None:
                 raise AssertionError("expected nested reduction stage")
-            return FusedNestedReductions(node1, node2, plan.nested_stage)
+            return FusedNestedReductions(node1, node2, plan.nested_stage, plan)
         elif MixOrderReduction.are_mix_order_reductions(node1, node2):
             return FusedMixOrderReductions(node1, node2)
         elif isinstance(node1, FusedNestedReductions):
@@ -13372,11 +13456,8 @@ class BaseScheduling:  # noqa: docstring_linter
                     raise AssertionError(
                         "staged reduction was committed without a semantic plan"
                     )
-                    if plan is not None:
-                        break
-                staged = plan is not None or self.has_sub_parent_epilogue(nodes)
-            node_type = FusedStagedReduction if staged else FusedSchedulerNode
-            return node_type.fuse(node1, node2)
+                fused.set_staged_plan(plan)
+            return fused
 
     def group_fn(
         self, sizes: Sequence[Sequence[sympy.Expr]]

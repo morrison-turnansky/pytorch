@@ -7,7 +7,6 @@ from torch._inductor.scheduler import (
     BaseSchedulerNode,
     BaseScheduling,
     FusedSchedulerNode,
-    FusedStagedReduction,
     Scheduler,
     SchedulerNode,
     SubParentFusionResult,

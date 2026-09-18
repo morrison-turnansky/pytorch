@@ -17,7 +17,6 @@ from torch._inductor.choices import InductorChoices
 from torch._inductor.scheduler import (
     FusedNestedReductions,
     FusedStagedReduction,
-    NestedReduction,
     Scheduler,
 )
 from torch._inductor.test_case import TestCase, run_tests
@@ -134,17 +133,9 @@ def _capture_staged_plans(nodes, staged_plans):
             node, FusedNestedReductions
         ):
             continue
-        reductions = [
-            candidate for candidate in node.get_nodes() if candidate.is_reduction()
-        ]
-        if not reductions:
-            continue
-        _, (parent_numel, parent_rnumel) = reductions[0].group
-        plan = NestedReduction.sub_parent_epilogue_plan(
-            node.get_nodes(), parent_numel, parent_rnumel
-        )
-        if plan is not None:
-            staged_plans.append(plan)
+        if node.staged_plan is None:
+            raise AssertionError("staged reduction is missing its final plan")
+        staged_plans.append(node.staged_plan)
 
 
 def _choices_context(force_persistent: bool | None):

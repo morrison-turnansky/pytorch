@@ -1713,6 +1713,7 @@ class _NestedReductionBase:
             staged = [node for node in nodes if isinstance(node, FusedStagedReduction)]
             self.assertEqual(len(staged), 1)
             self.assertIs(type(staged[0]), FusedStagedReduction)
+            self.assertIsNotNone(staged[0].staged_plan)
             saw_staged_reduction = True
             return nodes
 
