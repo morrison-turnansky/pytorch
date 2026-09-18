@@ -3273,8 +3273,12 @@ class SIMDScheduling(BaseScheduling):
                 and not isinstance(node, scheduler.FusedNestedReductions)
                 for node in (node1, node2)
             ):
-                nodes = [*node1.get_nodes(), *node2.get_nodes()]
-                if self._find_sub_parent_epilogue_plan(nodes) is None:
+                if any(
+                    getattr(node, "staged_plan", None) is None
+                    for node in (node1, node2)
+                    if isinstance(node, scheduler.FusedStagedReduction)
+                    and not isinstance(node, scheduler.FusedNestedReductions)
+                ):
                     why("staged reduction plan would be lost")
                     return False
 
@@ -3622,35 +3626,17 @@ class SIMDScheduling(BaseScheduling):
         return len(tiling) == 2
 
     def has_sub_parent_epilogue(self, nodes: Sequence[BaseSchedulerNode]) -> bool:
-        return self._find_sub_parent_epilogue_plan(list(nodes)) is not None
-
-    def validate_staged_reduction(self, node: scheduler.FusedStagedReduction) -> None:
-        """Reconstruct a committed standalone staged plan from final nodes."""
-        if not self._is_standalone_staged_reduction(node):
-            return
-        nodes = [
-            sn
-            for sn in node.get_nodes()
-            if not self.scheduler or sn.get_name() not in self.scheduler.removed_ops
-        ]
-        if self._find_sub_parent_epilogue_plan(nodes) is None:
-            raise AssertionError(
-                "committed sub-parent reduction plan was lost after scheduling"
-            )
-
-    def _find_sub_parent_epilogue_plan(
-        self,
-        nodes: Sequence[BaseSchedulerNode],
-    ) -> scheduler.StagedReductionPlan | None:
-        """Return the first valid standalone sub-parent plan for ``nodes``."""
         for node in nodes:
             if not node.is_reduction():
                 continue
             _, (parent_numel, parent_rnumel) = node.group
-            plan = self._sub_parent_epilogue_plan(nodes, parent_numel, parent_rnumel)
-            if plan is not None:
-                return plan
-        return None
+            if self._sub_parent_epilogue_plan(nodes, parent_numel, parent_rnumel):
+                return True
+        return False
+
+    def validate_staged_reduction(self, node: scheduler.FusedStagedReduction) -> None:
+        if node.staged_plan is None:
+            raise AssertionError("staged reduction semantic plan was lost")
 
     def generate_node_schedule(
         self,
@@ -4090,15 +4076,11 @@ class SIMDScheduling(BaseScheduling):
     def codegen_staged_reduction(self, node):
         """See Note [Sub-parent reduction epilogues]."""
         # TODO: Share the parent-kernel pipeline and specialize only stage emission.
+        plan = node.staged_plan
+        if plan is None:
+            raise AssertionError("staged reduction semantic plan was lost before codegen")
         if isinstance(node, scheduler.FusedNestedReductions):
-            plan = scheduler.NestedReduction.plan_from_topology(
-                node.node1,
-                node.node2,
-                node.grouped_reduction,
-                node.group_size,
-                node.grouped_axis,
-            )
-            if plan is None or plan.nested_stage is None:
+            if plan.nested_stage is None:
                 raise AssertionError("nested reduction plan was lost before codegen")
             return self._codegen_nested_reduction(node, plan)
 
@@ -4109,9 +4091,6 @@ class SIMDScheduling(BaseScheduling):
             for sn in node.get_nodes()
             if not self.scheduler or sn.get_name() not in self.scheduler.removed_ops
         ]
-        plan = self._find_sub_parent_epilogue_plan(nodes)
-        if plan is None:
-            raise AssertionError("sub-parent reduction plan was lost before codegen")
         return self._codegen_reduction_with_sub_parent_epilogue(nodes, plan)
 
     def _codegen_nested_reduction(self, node, plan):
