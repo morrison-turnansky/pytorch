@@ -17,7 +17,6 @@ from torch._inductor.codegen.simd import (
     _GroupedReductionLayout,
     _PointwiseRemapHandler,
     _SubParentValueResolver,
-    _TranslatedProjectionGeometry,
     SIMDScheduling,
 )
 from torch._inductor.codegen.simd_kernel_features import (
@@ -123,7 +122,7 @@ def _test_cases(device, dtype):
 
 
 class TestScheduler(TestCase):
-    def test_combined_scheduling_delegates_staged_validation(self):
+    def test_combined_scheduling_delegates_sub_parent_query(self):
         from torch._inductor.codegen.cuda_combined_scheduling import (
             CUDACombinedScheduling,
         )
@@ -131,18 +130,16 @@ class TestScheduler(TestCase):
             XPUCombinedScheduling,
         )
 
-        node = Mock()
+        nodes = (Mock(),)
         for scheduling_cls in (CUDACombinedScheduling, XPUCombinedScheduling):
             with self.subTest(scheduling_cls=scheduling_cls.__name__):
                 scheduling = scheduling_cls.__new__(scheduling_cls)
                 triton_scheduling = Mock()
                 scheduling._triton_scheduling = triton_scheduling
 
-                scheduling.validate_staged_reduction(node)
+                scheduling.has_sub_parent_epilogue(nodes)
 
-                triton_scheduling.validate_staged_reduction.assert_called_once_with(
-                    node
-                )
+                triton_scheduling.has_sub_parent_epilogue.assert_called_once_with(nodes)
 
     def test_translation_proof_matrix(self):
         """Keep the Phase 1 proof and rejection matrix in the in-tree suite."""
@@ -744,6 +741,42 @@ class TestScheduler(TestCase):
         self.assertEqual(args[1], 1)
         self.assertEqual(kwargs, {})
 
+    def test_translated_shape_admission(self):
+        row, feature = sympy.symbols(
+            "admission_row admission_feature", integer=True, nonnegative=True
+        )
+
+        def prove_translation(parent_width, factor):
+            child_width = parent_width // factor
+            source = MemoryDep(
+                "buf0",
+                parent_width * row + feature,
+                (row, feature),
+                (2, parent_width),
+            )
+            consumer = MemoryDep(
+                "buf0",
+                parent_width * row + feature + child_width,
+                (row, feature),
+                (2, child_width),
+            )
+            return NestedReduction._prove_sub_parent_translation(
+                (source,),
+                consumer,
+                2,
+                parent_width,
+                factor,
+                {},
+            )
+
+        with (
+            V.set_graph_handler(Mock(sizevars=SizeVarAllocator())),
+            inductor_config.patch(polyhedral_fusion=True),
+        ):
+            self.assertIsNone(prove_translation(192, 3))
+            self.assertIsNotNone(prove_translation(256, 4))
+            self.assertIsNone(prove_translation(384, 6))
+
     def test_sub_parent_resolver_rejects_inconsistent_name_contract(self):
         d0 = sympy.Symbol("d0", integer=True)
         access = MemoryDep("buf0", d0, (d0,), (sympy.Integer(16),))
@@ -859,7 +892,6 @@ class TestScheduler(TestCase):
         layout.group_tree.is_loop = False
         layout.parent_block = 256
         kernel = Mock(_load_mask=None, _load_other=None)
-        geometry = _TranslatedProjectionGeometry(3, 64, 256, 4)
         with (
             V.set_graph_handler(Mock(sizevars=SizeVarAllocator())),
             self.assertRaises(AssertionError),
@@ -873,77 +905,6 @@ class TestScheduler(TestCase):
                 sub_parent_factor=3,
                 parent_numel=4,
                 parent_rnumel=192,
-                translated_projection=geometry,
-            )
-
-
-    def test_translated_capability_gate_declines_unsupported_geometry(self):
-        row, feature = sympy.symbols(
-            "capability_row capability_feature", integer=True, nonnegative=True
-        )
-        source = MemoryDep(
-            "buf0",
-            192 * row + feature,
-            (row, feature),
-            (4, 192),
-        )
-
-        def make_plan(child_width, factor, translation):
-            consumer = MemoryDep(
-                "buf0",
-                192 * row + feature + translation,
-                (row, feature),
-                (4, child_width),
-            )
-            proof = SubParentAccessRelation.prove_translation(
-                source, consumer, sizevars=SizeVarAllocator()
-            )
-            self.assertIsNotNone(proof)
-            relation = SubParentAccessRelation(
-                (source,),
-                consumer,
-                None,
-                False,
-                translation=proof.translation,
-            )
-            stage = SubParentEpilogueStage(
-                factor=factor,
-                access_relations=(relation,),
-                output_groups=(
-                    SubParentOutputGroup(output_lanes=1, nodes=(Mock(),)),
-                ),
-            )
-            return StagedReductionPlan(
-                parent_nodes=(),
-                parent_numel=sympy.Integer(4),
-                parent_rnumel=sympy.Integer(192),
-                nested_stage=None,
-                sub_parent_stages=(stage,),
-            )
-
-        supported_plan = make_plan(64, 3, 0)
-        unsupported_plan = make_plan(96, 2, 0)
-        scheduling = object.__new__(SIMDScheduling)
-        scheduling.supports_sub_parent_epilogue = True
-        graph = Mock(sizevars=SizeVarAllocator())
-
-        with (
-            V.set_graph_handler(graph),
-            patch.object(
-                SIMDScheduling, "_sub_parent_tiling_is_2d", return_value=True
-            ),
-            patch.object(
-                NestedReduction,
-                "sub_parent_epilogue_plan",
-                side_effect=(supported_plan, unsupported_plan),
-            ),
-            inductor_config.patch({"triton.nested_reduction": True}),
-        ):
-            self.assertIs(
-                scheduling._sub_parent_epilogue_plan([], 4, 192), supported_plan
-            )
-            self.assertIsNone(
-                scheduling._sub_parent_epilogue_plan([], 4, 192)
             )
 
     def test_sub_parent_replay_compatibility_cross_name_lane_liveness(self):
