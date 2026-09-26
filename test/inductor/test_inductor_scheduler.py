@@ -1224,7 +1224,7 @@ class TestScheduler(TestCase):
         resolver._sub_parent_family = Mock()
         resolver._sub_parent_family.sub_parent_tree.return_value.block_size_str.return_value = "CHILD"
         resolver._sub_parent_factor = 2
-        resolver._translated_descriptor_indices = {}
+        resolver._dense_descriptor_indices = {}
         resolver.resolve_sources = Mock(return_value=(source,))
         resolver.materialize_source = Mock(return_value=child)
 
