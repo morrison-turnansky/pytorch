@@ -5243,7 +5243,6 @@ def is_strict_cuda_triton(device: torch.device) -> bool:
 
 
 def is_strict_float_dtype(dtype: torch.dtype) -> bool:
-    """Flag for floating dtypes supported by strict mode."""
     return dtype in (torch.bfloat16, torch.float16, torch.float32, torch.float64)
 
 
