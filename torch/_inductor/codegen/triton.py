@@ -1436,6 +1436,25 @@ class TritonOverrides(OpOverrides):
         else:
             out_dtype = triton_store_type(dtype)
 
+        if (
+            dtype in (torch.float16, torch.bfloat16)
+            and not use_compute_types
+            and src_dtype == torch.float32
+            and is_strict_cuda_pointwise()
+        ):
+            if dtype == torch.bfloat16:
+                device = V.graph.get_current_device_or_throw()
+                if torch.cuda.get_device_capability(device)[0] < 8:
+                    return f"{x}.to({out_dtype})"
+            # Constant folding uses LLVM's NaN payload instead of CUDA's 0x7fff.
+            # Keep the narrowing conversion in PTX, including for constant inputs.
+            ptx_dtype = "f16" if dtype == torch.float16 else "bf16"
+            return (
+                f"tl.inline_asm_elementwise('cvt.rn.{ptx_dtype}.f32 $0, $1;', "
+                f"'=h,f', [{x}.to(tl.float32)], dtype={out_dtype}, "
+                "is_pure=True, pack=1)"
+            )
+
         # Triton cannot cast integers to any fp8 type directly, so go through float32.
         if (
             src_dtype is not None
@@ -2385,7 +2404,10 @@ class TritonOverrides(OpOverrides):
     @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def log(x):
-        if config.eager_numerics.use_pytorch_libdevice:
+        if (
+            config.eager_numerics.use_pytorch_libdevice
+            or config.emulate_precision_casts
+        ):
             # Strict numerics should use the backend math library entry point.
             # On ROCm this maps to OCML and avoids Triton's generic log lowering.
             return f"libdevice.log({x})"

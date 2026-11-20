@@ -200,6 +200,27 @@ class StrictNumericsConfigTest(TestCase):
     "requires NVIDIA CUDA and Triton",
 )
 class StrictNumericsCompileTest(TestCase):
+    @dtypes(torch.float16, torch.bfloat16)
+    @parametrize("numerics", ("strict_pointwise", "strict"))
+    @parametrize("upcast", (False, True))
+    @parametrize("source", ("runtime", "where"))
+    def test_nan_conversion(self, device, dtype, numerics, upcast, source):
+        x = _sampled_fp32(NUM_BITPATTERN_SAMPLES, device)
+
+        def fn(x):
+            if source == "where":
+                x = torch.where(x.isnan(), float("nan"), x)
+            return x.to(dtype)
+
+        compiled = torch.compile(
+            fn,
+            fullgraph=True,
+            options={"numerics": numerics, "triton.codegen_upcast_to_fp32": upcast},
+        )
+        expected = fn(x)
+        result = compiled(x)
+        self.assertEqual(result.view(torch.int16), expected.view(torch.int16))
+
     @ops(
         [op for op in op_db if op.name in ("byte", "char", "short")],
         allowed_dtypes=(
@@ -1025,7 +1046,6 @@ BACKWARD_OPS = [op for op in POINTWISE_OPS if op.supports_autograd]
 # (op_id, dtype_label) pairs that must still differ from eager.
 POINTWISE_XFAIL = frozenset(
     {
-        ("xlogy", "float32"),
         ("div_no_rounding_mode", "bfloat16"),
         ("div_no_rounding_mode", "float16"),
         ("special_ndtr", "bfloat16"),
@@ -1141,13 +1161,9 @@ POINTWISE_XFAIL = frozenset(
         ("special_log_ndtr", "float32"),
         ("special_modified_bessel_i0", "float32"),
         ("special_modified_bessel_i1", "float32"),
-        ("special_xlog1py", "bfloat16"),
-        ("special_xlog1py", "float16"),
         ("sub", "bfloat16"),
         ("sub", "float16"),
         ("sub", "float32"),
-        ("xlogy", "bfloat16"),
-        ("xlogy", "float16"),
     }
 )
 
@@ -1243,13 +1259,9 @@ BACKWARD_XFAIL = frozenset(
         ("special_log_ndtr", "float32"),
         ("special_modified_bessel_i0", "float32"),
         ("special_modified_bessel_i1", "float32"),
-        ("special_xlog1py", "bfloat16"),
-        ("special_xlog1py", "float16"),
         ("tanh", "bfloat16"),
         ("tanh", "float16"),
         ("tanh", "float32"),
-        ("xlogy", "bfloat16"),
-        ("xlogy", "float16"),
     }
 )
 
@@ -1261,7 +1273,7 @@ NONFLOAT_XFAIL = frozenset(
 
 
 # Preserve all floating dtype coverage after removing repaired xfail entries.
-FULL_DTYPE_POINTWISE_OPS = frozenset({"div_trunc_rounding"})
+FULL_DTYPE_POINTWISE_OPS = frozenset({"div_trunc_rounding", "special_xlog1py", "xlogy"})
 
 
 class _strict_ops(ops):
@@ -1685,7 +1697,9 @@ class PointwiseStrictNumericsTest(TestCase):
         unittest.skip("uncompilable op under fullgraph"),
         lambda p: p["op"].name in COMPILE_UNSUPPORTED,
     )
-    @_strict_ops(BACKWARD_OPS, BACKWARD_XFAIL)
+    @_strict_ops(
+        BACKWARD_OPS, BACKWARD_XFAIL, full_dtype_ops=("special_xlog1py", "xlogy")
+    )
     def test_pointwise_backward(self, device, dtype, op):
         mismatches = self._sweep_backward(device, op, dtype, POINTWISE_STRICT_CFG)
         self._assert_ledger(
