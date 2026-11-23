@@ -1026,8 +1026,8 @@ BACKWARD_OPS = [op for op in POINTWISE_OPS if op.supports_autograd]
 POINTWISE_XFAIL = frozenset(
     {
         ("xlogy", "float32"),
-        ("div_no_rounding_mode", "bfloat16"),
-        ("div_no_rounding_mode", "float16"),
+        # ("div_no_rounding_mode", "bfloat16"),
+        # ("div_no_rounding_mode", "float16"),
         ("special_ndtr", "bfloat16"),
         ("special_ndtr", "float16"),
         ("true_divide", "bfloat16"),
@@ -1261,7 +1261,7 @@ NONFLOAT_XFAIL = frozenset(
 
 
 # Preserve all floating dtype coverage after removing repaired xfail entries.
-FULL_DTYPE_POINTWISE_OPS = frozenset({"div_trunc_rounding"})
+FULL_DTYPE_POINTWISE_OPS = frozenset({"div_trunc_rounding", "div_no_rounding_mode"})
 
 
 class _strict_ops(ops):
