@@ -379,52 +379,56 @@ class StrictNumericsCompileTest(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16)
     @parametrize("numerics", ("strict_pointwise", "strict"))
-    def test_div_trunc_scalar_output_rounding(self, device, dtype, numerics):
+    @parametrize("mode", (None, "trunc"))
+    def test_div_scalar_output_rounding(self, device, dtype, numerics, mode):
         # Cover rounding before a float consumer.
-        # Non-strict returns 2635: fusion skips the intermediate fp16/bf16 rounding.
+        # Non-strict trunc division skips intermediate fp16/bf16 rounding.
         x = torch.tensor([10048.0], device=device, dtype=dtype)
 
         def fn(x):
-            return torch.div(x, 3.8125, rounding_mode="trunc").float()
+            return torch.div(x, 3.8125, rounding_mode=mode).float()
 
         compiled = torch.compile(fn, fullgraph=True, options={"numerics": numerics})
-        self.assertEqual(compiled(x), fn(x))
+        self.assertEqual(compiled(x), fn(x), atol=0, rtol=0)
 
     @dtypes(torch.float32)
     @parametrize("numerics", ("strict_pointwise", "strict"))
-    def test_div_trunc_scalar_reciprocal_rounding(self, device, dtype, numerics):
+    @parametrize("mode", (None, "trunc"))
+    def test_div_scalar_reciprocal_rounding(self, device, dtype, numerics, mode):
         # Cover a Python divisor not representable in fp32.
-        # Non-strict returns 0.0: the reciprocal is taken before fp32 rounding.
+        # Trunc division rounds the divisor to fp32 before taking its reciprocal.
         x = torch.tensor([1.0], device=device, dtype=dtype)
 
         def fn(x):
-            return torch.div(x, 1.00000004, rounding_mode="trunc")
+            return torch.div(x, 1.00000004, rounding_mode=mode)
 
         compiled = torch.compile(fn, fullgraph=True, options={"numerics": numerics})
-        self.assertEqual(compiled(x), fn(x))
+        self.assertEqual(compiled(x), fn(x), atol=0, rtol=0)
 
     @dtypes(torch.float32)
     @parametrize("numerics", ("strict_pointwise", "strict"))
-    def test_div_trunc_cpu_scalar_reciprocal(self, device, dtype, numerics):
+    @parametrize("mode", (None, "trunc"))
+    def test_div_cpu_scalar_reciprocal(self, device, dtype, numerics, mode):
         # Cover CPU tensor reciprocal selection.
-        # Non-strict returns 3.0: it divides directly instead of multiplying.
+        # Non-strict trunc division divides directly instead of multiplying.
         x = torch.tensor([11.4375], device=device, dtype=dtype)
         divisor = torch.tensor(3.8125, device="cpu")
 
         def fn(x, divisor):
-            return torch.div(x, divisor, rounding_mode="trunc")
+            return torch.div(x, divisor, rounding_mode=mode)
 
         compiled = torch.compile(fn, fullgraph=True, options={"numerics": numerics})
-        self.assertEqual(compiled(x, divisor), fn(x, divisor))
+        self.assertEqual(compiled(x, divisor), fn(x, divisor), atol=0, rtol=0)
 
     @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
     @parametrize("numerics", ("strict_pointwise", "strict"))
+    @parametrize("mode", (None, "trunc"))
     @parametrize("size", (49, 98))
-    def test_div_trunc_symbolic_scalar_reciprocal(self, device, dtype, numerics, size):
+    def test_div_symbolic_scalar_reciprocal(self, device, dtype, numerics, mode, size):
         x = torch.full((size,), size, device=device, dtype=dtype)
 
         def fn(x):
-            return torch.div(x, x.shape[0], rounding_mode="trunc")
+            return torch.div(x, x.shape[0], rounding_mode=mode)
 
         compiled = torch.compile(
             fn, fullgraph=True, dynamic=True, options={"numerics": numerics}
@@ -433,10 +437,11 @@ class StrictNumericsCompileTest(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
     @parametrize("numerics", ("strict_pointwise", "strict"))
+    @parametrize("mode", (None, "trunc"))
     @parametrize("view", ("select", "squeeze"))
     @parametrize("scalar_input", (False, True))
-    def test_div_trunc_cpu_scalar_view(
-        self, device, dtype, numerics, view, scalar_input
+    def test_div_cpu_scalar_view(
+        self, device, dtype, numerics, mode, view, scalar_input
     ):
         x = torch.tensor([11.4375], device=device, dtype=dtype)
         if scalar_input:
@@ -445,41 +450,42 @@ class StrictNumericsCompileTest(TestCase):
 
         def fn(x, cpu):
             divisor = cpu[1] if view == "select" else cpu[1:2].squeeze()
-            return torch.div(x, divisor, rounding_mode="trunc")
+            return torch.div(x, divisor, rounding_mode=mode)
 
         compiled = torch.compile(fn, fullgraph=True, options={"numerics": numerics})
         self.assertEqual(compiled(x, cpu), fn(x, cpu), atol=0, rtol=0)
 
     @dtypes(torch.float16, torch.bfloat16)
     @parametrize("numerics", ("strict_pointwise", "strict"))
-    def test_div_trunc_cpu_scalar_precision(self, device, dtype, numerics):
-        # Cover mixed-dtype CPU scalar promotion.
-        # Non-strict also returns 0.0: fp32 codegen skips low-precision casts.
+    @parametrize("mode", (None, "trunc"))
+    def test_div_cpu_scalar_precision(self, device, dtype, numerics, mode):
+        # Cover mixed-dtype CPU scalars and the different reciprocal precision.
         x = torch.tensor([1.0009765625], device=device, dtype=dtype)
         divisor = torch.tensor(1.001, dtype=torch.float64, device="cpu")
 
         def fn(x, divisor):
-            return torch.div(x, divisor, rounding_mode="trunc")
+            return torch.div(x, divisor, rounding_mode=mode)
 
         compiled = torch.compile(fn, fullgraph=True, options={"numerics": numerics})
-        self.assertEqual(compiled(x, divisor), fn(x, divisor))
+        self.assertEqual(compiled(x, divisor), fn(x, divisor), atol=0, rtol=0)
 
     @dtypes(torch.float64)
     @parametrize("numerics", ("strict_pointwise", "strict"))
+    @parametrize("mode", (None, "trunc"))
     @parametrize("tensor_divisor", (False, True))
-    def test_div_trunc_fp64_scalar_reciprocal(
-        self, device, dtype, numerics, tensor_divisor
+    def test_div_fp64_scalar_reciprocal(
+        self, device, dtype, numerics, mode, tensor_divisor
     ):
         # Cover fp64 scalar reciprocals; the generic sweep excludes fp64.
-        # Non-strict returns 1 for CPU tensors; Python scalars already use a reciprocal.
+        # CPU tensors and Python scalars both use reciprocal multiplication.
         x = torch.tensor(49.0, device=device, dtype=dtype)
         divisor = torch.tensor(49.0, dtype=dtype) if tensor_divisor else 49.0
 
         def fn(x, divisor):
-            return torch.div(x, divisor, rounding_mode="trunc")
+            return torch.div(x, divisor, rounding_mode=mode)
 
         compiled = torch.compile(fn, fullgraph=True, options={"numerics": numerics})
-        self.assertEqual(compiled(x, divisor), fn(x, divisor))
+        self.assertEqual(compiled(x, divisor), fn(x, divisor), atol=0, rtol=0)
 
     @parametrize("numerics", ("strict_pointwise", "strict"))
     def test_compile_options_enable_eager_division(self, device, numerics):
@@ -1026,12 +1032,8 @@ BACKWARD_OPS = [op for op in POINTWISE_OPS if op.supports_autograd]
 POINTWISE_XFAIL = frozenset(
     {
         ("xlogy", "float32"),
-        # ("div_no_rounding_mode", "bfloat16"),
-        # ("div_no_rounding_mode", "float16"),
         ("special_ndtr", "bfloat16"),
         ("special_ndtr", "float16"),
-        ("true_divide", "bfloat16"),
-        ("true_divide", "float16"),
         ("abs", "bfloat16"),
         ("abs", "float16"),
         ("abs", "float32"),
@@ -1261,7 +1263,9 @@ NONFLOAT_XFAIL = frozenset(
 
 
 # Preserve all floating dtype coverage after removing repaired xfail entries.
-FULL_DTYPE_POINTWISE_OPS = frozenset({"div_trunc_rounding", "div_no_rounding_mode"})
+FULL_DTYPE_POINTWISE_OPS = frozenset(
+    {"div_trunc_rounding", "div_no_rounding_mode", "true_divide"}
+)
 
 
 class _strict_ops(ops):

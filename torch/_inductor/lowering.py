@@ -8209,16 +8209,19 @@ def _floor_div_floating(a, b):
     return make_pointwise(fn)(a, b, nan, neg_one, zero)
 
 
-def _div_trunc_cuda_scalar(
-    a: TensorBox | IRNode, b: TensorBox | IRNode | int | float | sympy.Basic
+def _div_cuda_scalar(
+    a: TensorBox | IRNode,
+    b: TensorBox | IRNode | int | float | sympy.Basic,
+    rounding_mode: str | None,
 ) -> TensorBox:
-    # Match eager CUDA: use the accumulation dtype, then round after truncation.
     compute_dtype = get_computation_dtype(a.get_dtype())
+    # Eager true division takes the reciprocal in double before the opmath cast.
+    reciprocal_dtype = torch.float64 if rounding_mode is None else compute_dtype
     if isinstance(b, (int, float)):
-        b = ir.Constant(value=b, dtype=compute_dtype, device=a.get_device_or_error())
+        b = ir.Constant(value=b, dtype=reciprocal_dtype, device=a.get_device_or_error())
     elif isinstance(b, sympy.Basic):
         b = ir.IndexingConstant(
-            index=b, dtype=compute_dtype, device=a.get_device_or_error()
+            index=b, dtype=reciprocal_dtype, device=a.get_device_or_error()
         )
     elif isinstance(b, TensorBox):
         b = maybe_copy_cpu_scalar(b, a.get_device_or_error())
@@ -8227,9 +8230,10 @@ def _div_trunc_cuda_scalar(
     def fn(value, divisor):
         value = ops.to_dtype(value, compute_dtype)
         reciprocal = ops.div_rn(
-            ops.constant(1.0, compute_dtype), ops.to_dtype(divisor, compute_dtype)
+            ops.constant(1.0, reciprocal_dtype), ops.to_dtype(divisor, reciprocal_dtype)
         )
-        return ops.trunc(ops.mul(value, reciprocal))
+        result = ops.mul(value, ops.to_dtype(reciprocal, compute_dtype))
+        return ops.trunc(result) if rounding_mode == "trunc" else result
 
     return make_pointwise(fn, force_output_cast=True)(a, b)
 
@@ -8245,11 +8249,24 @@ def div_mode(a, b, rounding_mode=None):
     scalar_divisor = (
         b if isinstance(b, (int, float, sympy.Basic)) or is_cpu_scalar else None
     )
-    (a, b), _ = transform_args(
-        [a, b], {}, True, ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT, False
+    promotion = (
+        ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
+        if rounding_mode is None
+        else ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
     )
+    (a, b), _ = transform_args([a, b], {}, True, promotion, False)
     both_integer = is_integer_type(a) and is_integer_type(b)
     both_boolean = is_boolean_type(a) and is_boolean_type(b)
+
+    if (
+        rounding_mode in (None, "trunc")
+        and isinstance(a, (TensorBox, IRNode))
+        and (device := a.get_device()) is not None
+        and is_strict_cuda_triton(device)
+        and scalar_divisor is not None
+        and is_strict_float_dtype(a.get_dtype())
+    ):
+        return _div_cuda_scalar(a, scalar_divisor, rounding_mode)
 
     # floordiv and truncdiv need special handling for integer tensors on Triton,
     # see the discussion at https://github.com/triton-lang/triton/issues/605
@@ -8270,16 +8287,11 @@ def div_mode(a, b, rounding_mode=None):
             )
         if both_integer:
             return truncdiv(a, b)
-        if (
-            isinstance(a, (TensorBox, IRNode))
-            and (device := a.get_device()) is not None
-            and is_strict_cuda_triton(device)
-            and scalar_divisor is not None
-            and is_strict_float_dtype(a.get_dtype())
-        ):
-            return _div_trunc_cuda_scalar(a, scalar_divisor)
         return trunc(div(a, b))
-    return div(a, b)
+    a, b = promote_constants(
+        (a, b), type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
+    )
+    return div_prim(a, b)
 
 
 @register_lowering([aten.mul], broadcast=True)
@@ -8359,14 +8371,10 @@ register_pointwise_op("truediv")
 
 @register_lowering(
     [aten.true_divide, aten.div.Tensor],
-    broadcast=True,
-    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    type_promotion_kind=None,
 )
 def div(a, b):
-    a, b = promote_constants(
-        (a, b), type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
-    )
-    return div_prim(a, b)
+    return div_mode(a, b)
 
 
 @register_lowering([aten.fmod, prims.fmod], broadcast=True)

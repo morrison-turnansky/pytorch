@@ -3358,10 +3358,9 @@ class ConstructorMoverPass:
         if is_index_put_and_requires_h2d_sync_for_gpu_value(node):
             return True
 
-        if (
-            node.target != aten.div.Tensor_mode
-            or node.kwargs.get("rounding_mode") != "trunc"
-        ):
+        div_ops = (aten.div.Tensor, aten.div.Tensor_mode)
+        mode = node.kwargs.get("rounding_mode")
+        if node.target not in div_ops or mode not in (None, "trunc"):
             return False
 
         val = node.meta.get("val")
