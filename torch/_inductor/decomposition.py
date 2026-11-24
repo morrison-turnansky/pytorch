@@ -808,7 +808,7 @@ def angle(x: torch.Tensor) -> torch.Tensor:
     # mps has no integer signbit and integers have no -0
     is_neg = torch.signbit(x) if x.is_floating_point() else x < 0
     ret = torch.where(is_neg, pi, 0.0)
-    return torch.where(torch.isnan(x), float("nan"), ret)
+    return torch.where(torch.isnan(x), x, ret)
 
 
 @register_decomposition([aten.add])
