@@ -8289,7 +8289,9 @@ def mul(a, b):
         return logical_and(a, b)
     else:
         fn = ops_wrapper(aten.mul.__name__)
-        return make_pointwise(fn)(a, b)
+        return make_pointwise(
+            fn, preserve_cuda_scalar_precision=config.strict_pointwise
+        )(a, b)
 
 
 register_pointwise_op("mul")
