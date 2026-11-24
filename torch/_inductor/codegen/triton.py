@@ -1517,10 +1517,23 @@ class TritonOverrides(OpOverrides):
         return f"({arg}).to({triton_type(dtype)})"
 
     @staticmethod
-    @maybe_upcast_float32()
     # pyrefly: ignore [bad-override]
     def abs(x):
-        return f"tl_math.abs({x})"
+        dtype = triton_arg_dtype(x)
+        upcast = needs_upcast_to_float32(x)
+        arg = f"{x}.to(tl.float32)" if upcast else f"{x}"
+        if is_strict_cuda_pointwise() and dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            # CUDA fabsf canonicalizes NaNs; tl.abs preserves their payloads.
+            result = f"libdevice.abs({arg})"
+        else:
+            result = f"tl_math.abs({arg})"
+        if upcast and dtype is not None:
+            return f"{result}.to({triton_type(dtype)})"
+        return result
 
     # TODO - register these ops as having divergent dtype
     # output if doing graph pass to remove consecutive casts
@@ -2478,8 +2491,9 @@ class TritonOverrides(OpOverrides):
         return f"libdevice.ceil({x})"
 
 
-# Register the custom pow override after class creation so type checkers see
+# Register custom overrides after class creation so type checkers see
 # a plain callable instead of the class-body staticmethod descriptor.
+OpDtypeSupport.register_upcast(TritonOverrides.abs, True)
 OpDtypeSupport.register_upcast(TritonOverrides.atan, True)
 OpDtypeSupport.register_upcast(TritonOverrides.pow, True)
 TritonOverrides._initialize_pointwise_overrides("triton")
